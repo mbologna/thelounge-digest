@@ -7,6 +7,10 @@ dependencies = []
 
 [tool.uv]
 package = false
+# Resolve only releases at least 7 days old; see README "Dependency updates".
+exclude-newer = "7 days"
+# Relative exclude-newer needs uv 0.12.12+; setup-uv in CI also reads this.
+required-version = ">=0.12.12"
 
 [dependency-groups]
 dev = [

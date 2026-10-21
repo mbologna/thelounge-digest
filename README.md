@@ -84,3 +84,11 @@ works well for periodic digests.
 ```sh
 uv run pytest
 ```
+
+## Dependency updates
+
+`uv` resolves only package releases at least 7 days old (`exclude-newer` in
+`pyproject.toml`), so a compromised release has time to be caught before it
+lands in `uv.lock`. A CVE fix released less than 7 days ago needs a temporary
+override, e.g. `exclude-newer-package = { pytest = false }` under
+`[tool.uv]`; remove it once the release is a week old.

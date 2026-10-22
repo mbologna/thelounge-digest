@@ -22,7 +22,7 @@ permissions:
 
 jobs:
   python:
-    uses: mbologna/.github/.github/workflows/python-ci.yml@0436a70711b0ac798568028cba01d78e896e4075 # main
+    uses: mbologna/.github/.github/workflows/python-ci.yml@809971a266efb82ee08bbb0b5e450c8217a806a8 # main
     with:
       python_version: "3.12"
       use_uv: true
@@ -31,7 +31,7 @@ jobs:
 
   docker:
     needs: python
-    uses: mbologna/.github/.github/workflows/docker-ci.yml@0436a70711b0ac798568028cba01d78e896e4075 # main
+    uses: mbologna/.github/.github/workflows/docker-ci.yml@809971a266efb82ee08bbb0b5e450c8217a806a8 # main
     with:
       image_name: thelounge-digest
       push_to_dockerhub: false
@@ -47,14 +47,14 @@ jobs:
     permissions:
       contents: write
       actions: write
-    uses: mbologna/.github/.github/workflows/auto-release.yml@0436a70711b0ac798568028cba01d78e896e4075 # main
+    uses: mbologna/.github/.github/workflows/auto-release.yml@809971a266efb82ee08bbb0b5e450c8217a806a8 # main
     with:
       strategy: commits
     secrets: inherit
 
   cache-cleanup:
     if: github.event_name == 'schedule'
-    uses: mbologna/.github/.github/workflows/cache-cleanup.yml@0436a70711b0ac798568028cba01d78e896e4075 # main
+    uses: mbologna/.github/.github/workflows/cache-cleanup.yml@809971a266efb82ee08bbb0b5e450c8217a806a8 # main
     with:
       max_age_days: 7
     permissions:

@@ -7,4 +7,8 @@ RUN /usr/local/bin/python3 -m pip uninstall -y --root-user-action=ignore pip \
     && rm -rf /usr/local/lib/python3*/ensurepip
 WORKDIR /app
 COPY digest.py .
+# The Lounge's own UID in its official image, so the read-only mount of its
+# home is readable; /data (the cursor) must be writable by it. Snapshots go
+# to /tmp.
+USER 1000:1000
 CMD ["python", "/app/digest.py"]

@@ -76,6 +76,10 @@ docker run --rm \
   ghcr.io/mbologna/thelounge-digest:latest
 ```
 
+The container runs as UID/GID 1000:1000, The Lounge's own user in its
+official image. The `/data` directory must be writable by that user
+(`chown 1000:1000 /path/to/data`); `--user` picks another one.
+
 Images are built for linux/amd64 and linux/arm64. A systemd timer running the container with podman
 works well for periodic digests.
 

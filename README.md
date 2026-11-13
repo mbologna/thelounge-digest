@@ -48,7 +48,7 @@ All configuration is via environment variables:
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `DIGEST_CHANNELS` | yes | — | Comma-separated `Network/#channel` pairs, e.g. `Libera/#chan,Libera/##other` |
-| `APPRISE_URL` | yes* | — | Apprise notify endpoint to POST the digest to (*not required for `--dry-run`/`--init`) |
+| `APPRISE_URL` | yes* | — | Apprise notify endpoint to POST the digest to (*not required for `--dry-run`/`--init`). Several whitespace-separated URLs serving the same tag are tried in order, so a second Apprise instance can be the fallback |
 | `DIGEST_BOTS` | no | `""` | Comma-separated bot nicks — rendered distinctly and excluded from nick colors and trending-link detection |
 | `DIGEST_KEYWORDS` | no | `""` | Comma-separated keywords to highlight/surface in a dedicated section |
 | `THELOUNGE_DB` | no | `/thelounge/logs/<user>.sqlite3` | Path to TheLounge's sqlite log DB |

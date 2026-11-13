@@ -284,6 +284,48 @@ class TestChunkBody(unittest.TestCase):
         self.assertEqual(len(digest.chunk_body(body, max_len=4000)), 1)
 
 
+class TestPostToAppriseFallback(unittest.TestCase):
+    def setUp(self):
+        self._sleep_patch = mock.patch.object(digest.time, "sleep")
+        self.sleep = self._sleep_patch.start()
+
+    def tearDown(self):
+        self._sleep_patch.stop()
+
+    def _ok(self):
+        resp = mock.MagicMock()
+        resp.status = 200
+        resp.__enter__.return_value = resp
+        return resp
+
+    def test_unreachable_first_url_falls_back_without_waiting(self):
+        with mock.patch.object(
+            digest.urllib.request, "urlopen", side_effect=[urllib.error.URLError("down"), self._ok()]
+        ) as m:
+            self.assertTrue(digest.post_to_apprise("http://a/notify/x http://b/notify/x", "t", "b"))
+        self.assertEqual([c.args[0].full_url for c in m.call_args_list], ["http://a/notify/x", "http://b/notify/x"])
+        self.sleep.assert_not_called()
+
+    def test_http_error_moves_to_the_next_url_and_is_not_retried(self):
+        err = urllib.error.HTTPError("url", 500, "Internal Server Error", {}, None)
+        with mock.patch.object(
+            digest.urllib.request, "urlopen", side_effect=[err, urllib.error.URLError("down"), self._ok()]
+        ) as m:
+            self.assertTrue(digest.post_to_apprise("http://a/notify/x http://b/notify/x", "t", "b"))
+        # a (500) dropped, b unreachable, then the next attempt tries only b
+        self.assertEqual(
+            [c.args[0].full_url for c in m.call_args_list],
+            ["http://a/notify/x", "http://b/notify/x", "http://b/notify/x"],
+        )
+
+    def test_every_url_rejecting_fails_at_once(self):
+        err = urllib.error.HTTPError("url", 500, "Internal Server Error", {}, None)
+        with mock.patch.object(digest.urllib.request, "urlopen", side_effect=[err, err]) as m:
+            self.assertFalse(digest.post_to_apprise("http://a/notify/x http://b/notify/x", "t", "b"))
+        self.assertEqual(m.call_count, 2)
+        self.sleep.assert_not_called()
+
+
 class TestWithPreview(unittest.TestCase):
     BASE = "http://apprise/notify/abc"
 
@@ -304,6 +346,10 @@ class TestWithPreview(unittest.TestCase):
         url = digest.with_preview(self.BASE + "?token=xyz", enabled=True)
         self.assertIn("token=xyz", url)
         self.assertIn("preview=yes", url)
+
+    def test_every_fallback_url_gets_it(self):
+        url = digest.with_preview(self.BASE + " http://other/notify/abc", enabled=False)
+        self.assertEqual(url, "http://apprise/notify/abc?preview=no http://other/notify/abc?preview=no")
 
 
 class TestFormatSpan(unittest.TestCase):

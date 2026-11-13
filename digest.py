@@ -461,7 +461,13 @@ def format_channel_section(network, channel, messages, nick_colors):
 
 
 def with_preview(url, enabled: bool) -> str:
-    """Return the Apprise URL with the ?preview= parameter forced to yes/no."""
+    """Return the Apprise URL with the ?preview= parameter forced to yes/no.
+
+    Several whitespace-separated URLs (APPRISE_URL's fallbacks) each get it."""
+    return " ".join(_with_preview_one(u, enabled) for u in url.split())
+
+
+def _with_preview_one(url, enabled: bool) -> str:
     parsed = urllib.parse.urlparse(url)
     params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
     params["preview"] = ["yes" if enabled else "no"]
@@ -491,38 +497,48 @@ def chunk_body(body, max_len=4000):
 
 
 # Retries for transient network errors only (e.g. a cold cross-cluster path).
-# An HTTP error response means Apprise was reached and rejected the request,
-# so those aren't retried.
+# An HTTP error response means that Apprise was reached and rejected the request,
+# so it isn't retried; the next URL still is.
 _APPRISE_POST_MAX_ATTEMPTS = 3
 _APPRISE_POST_RETRY_BACKOFF_SECONDS = 3.0
 
 
 def post_to_apprise(url, title, body):
-    """POST digest to Apprise, retrying on transient network errors. Returns True on success."""
+    """POST digest to Apprise, retrying on transient network errors. Returns True on success.
+
+    url may hold several whitespace-separated Apprise URLs serving the same tag (a
+    second instance as the fallback): each attempt tries them in order and the first
+    that answers 200 wins."""
     payload = json.dumps({"title": title, "body": body, "type": "info", "format": "html"}).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    print(f"POSTing digest to {url} ...")
+    urls = url.split()
     for attempt in range(1, _APPRISE_POST_MAX_ATTEMPTS + 1):
-        try:
-            with urllib.request.urlopen(req, timeout=90) as resp:
-                status = resp.status
-                print(f"Apprise responded with HTTP {status}")
-                return status == 200
-        except urllib.error.HTTPError as e:
-            print(f"Error: Apprise HTTP {e.code}: {e.reason}", file=sys.stderr)
-            return False
-        except urllib.error.URLError as e:
-            print(
-                f"Error: Could not reach Apprise (attempt {attempt}/{_APPRISE_POST_MAX_ATTEMPTS}): {e.reason}",
-                file=sys.stderr,
+        for target in list(urls):
+            req = urllib.request.Request(
+                target,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
             )
-            if attempt < _APPRISE_POST_MAX_ATTEMPTS:
-                time.sleep(_APPRISE_POST_RETRY_BACKOFF_SECONDS)
+            print(f"POSTing digest to {target} ...")
+            try:
+                with urllib.request.urlopen(req, timeout=90) as resp:
+                    status = resp.status
+                    print(f"Apprise responded with HTTP {status}")
+                    if status == 200:
+                        return True
+                    urls.remove(target)
+            except urllib.error.HTTPError as e:
+                print(f"Error: Apprise HTTP {e.code}: {e.reason}", file=sys.stderr)
+                urls.remove(target)
+            except urllib.error.URLError as e:
+                print(
+                    f"Error: Could not reach Apprise (attempt {attempt}/{_APPRISE_POST_MAX_ATTEMPTS}): {e.reason}",
+                    file=sys.stderr,
+                )
+        if not urls:
+            return False
+        if attempt < _APPRISE_POST_MAX_ATTEMPTS:
+            time.sleep(_APPRISE_POST_RETRY_BACKOFF_SECONDS)
     return False
 
 

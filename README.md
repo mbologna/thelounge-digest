@@ -25,9 +25,10 @@ Each run:
    (message/channel/trending/keyword counts) so the digest is skimmable at a
    glance.
 6. POSTs the digest to Apprise, chunked to stay under Telegram's message size
-   limit, with a short delay between chunks to avoid flood control, and
-   retries a few times on transient network errors (e.g. a cold cross-cluster
-   path) before giving up.
+   limit, with a short delay between chunks to avoid flood control. The
+   [apprise-notify](https://github.com/mbologna/apprise-notify-py) client
+   retries each URL once on a network error or HTTP 5xx (e.g. a cold
+   cross-cluster path), then moves on to the next URL before giving up.
 7. Saves the new cursor — only after a successful delivery.
 
 It reads TheLounge's `messages` table directly:
@@ -48,7 +49,7 @@ All configuration is via environment variables:
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `DIGEST_CHANNELS` | yes | — | Comma-separated `Network/#channel` pairs, e.g. `Libera/#chan,Libera/##other` |
-| `APPRISE_URL` | yes* | — | Apprise notify endpoint to POST the digest to (*not required for `--dry-run`/`--init`). Several whitespace-separated URLs serving the same tag are tried in order, so a second Apprise instance can be the fallback |
+| `APPRISE_URL` | yes* | — | Apprise notify endpoint to POST the digest to (*not required for `--dry-run`/`--init`). Several whitespace-separated URLs serving the same tag are tried in order until one delivers, so a second Apprise instance can be the fallback |
 | `DIGEST_BOTS` | no | `""` | Comma-separated bot nicks — rendered distinctly and excluded from nick colors and trending-link detection |
 | `DIGEST_KEYWORDS` | no | `""` | Comma-separated keywords to highlight/surface in a dedicated section |
 | `THELOUNGE_DB` | no | `/thelounge/logs/<user>.sqlite3` | Path to TheLounge's sqlite log DB |

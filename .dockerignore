@@ -5,7 +5,5 @@
 test_digest.py
 __pycache__/
 *.pyc
-pyproject.toml
-uv.lock
 LICENSE
 README.md

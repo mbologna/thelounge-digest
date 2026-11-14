@@ -22,10 +22,10 @@ import sqlite3
 import sys
 import tempfile
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from datetime import datetime
+
+from apprise_notify import notify
 
 # ---------------------------------------------------------------------------
 # Configuration from environment variables
@@ -496,50 +496,21 @@ def chunk_body(body, max_len=4000):
     return chunks
 
 
-# Retries for transient network errors only (e.g. a cold cross-cluster path).
-# An HTTP error response means that Apprise was reached and rejected the request,
-# so it isn't retried; the next URL still is.
-_APPRISE_POST_MAX_ATTEMPTS = 3
-_APPRISE_POST_RETRY_BACKOFF_SECONDS = 3.0
+# Generous: Apprise answers only once it has handed the digest to every service
+# behind the tag, and the path to it may cross a cold tailnet link.
+_APPRISE_POST_TIMEOUT_SECONDS = 90
 
 
 def post_to_apprise(url, title, body):
-    """POST digest to Apprise, retrying on transient network errors. Returns True on success.
+    """POST digest to Apprise. Returns True on success.
 
     url may hold several whitespace-separated Apprise URLs serving the same tag (a
-    second instance as the fallback): each attempt tries them in order and the first
-    that answers 200 wins."""
-    payload = json.dumps({"title": title, "body": body, "type": "info", "format": "html"}).encode("utf-8")
+    second instance as the fallback). apprise-notify tries them in order: the first
+    that delivers wins, a network error or HTTP 5xx is retried once before moving on,
+    and failures are printed to stderr."""
     urls = url.split()
-    for attempt in range(1, _APPRISE_POST_MAX_ATTEMPTS + 1):
-        for target in list(urls):
-            req = urllib.request.Request(
-                target,
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            print(f"POSTing digest to {target} ...")
-            try:
-                with urllib.request.urlopen(req, timeout=90) as resp:
-                    status = resp.status
-                    print(f"Apprise responded with HTTP {status}")
-                    if status == 200:
-                        return True
-                    urls.remove(target)
-            except urllib.error.HTTPError as e:
-                print(f"Error: Apprise HTTP {e.code}: {e.reason}", file=sys.stderr)
-                urls.remove(target)
-            except urllib.error.URLError as e:
-                print(
-                    f"Error: Could not reach Apprise (attempt {attempt}/{_APPRISE_POST_MAX_ATTEMPTS}): {e.reason}",
-                    file=sys.stderr,
-                )
-        if not urls:
-            return False
-        if attempt < _APPRISE_POST_MAX_ATTEMPTS:
-            time.sleep(_APPRISE_POST_RETRY_BACKOFF_SECONDS)
-    return False
+    print(f"POSTing digest to Apprise ({len(urls)} URL(s), tried in order) ...")
+    return notify(urls, title, body, type_="info", timeout=_APPRISE_POST_TIMEOUT_SECONDS, format_="html")
 
 
 def main():

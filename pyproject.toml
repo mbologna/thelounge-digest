@@ -3,7 +3,9 @@ name = "thelounge-digest"
 version = "0.1.0"
 description = "IRC digest notifier for TheLounge"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "apprise-notify @ git+https://github.com/mbologna/apprise-notify-py@v1.2.0",
+]
 
 [tool.uv]
 package = false
@@ -11,6 +13,9 @@ package = false
 exclude-newer = "7 days"
 # Relative exclude-newer needs uv 0.12.12+; setup-uv in CI also reads this.
 required-version = ">=0.12.12"
+# apprise-notify is a git dependency pinned by tag, which the cutoff does not
+# cover anyway; the entry keeps it exempt if it moves to a registry.
+exclude-newer-package = { apprise-notify = false }
 
 [dependency-groups]
 dev = [

@@ -12,6 +12,8 @@ import urllib.error
 from datetime import date, datetime, time
 from unittest import mock
 
+import apprise_notify
+
 # digest.py reads env vars and opens files at import time only inside main(),
 # so a plain import is safe.
 import digest
@@ -284,46 +286,67 @@ class TestChunkBody(unittest.TestCase):
         self.assertEqual(len(digest.chunk_body(body, max_len=4000)), 1)
 
 
-class TestPostToAppriseFallback(unittest.TestCase):
+class TestPostToApprise(unittest.TestCase):
+    """post_to_apprise hands the URLs to apprise-notify: tried in order, first delivery wins."""
+
+    A, B = "http://a/notify/x", "http://b/notify/x"
+
     def setUp(self):
-        self._sleep_patch = mock.patch.object(digest.time, "sleep")
-        self.sleep = self._sleep_patch.start()
+        patch = mock.patch.object(apprise_notify, "RETRY_DELAY", 0)
+        patch.start()
+        self.addCleanup(patch.stop)
 
-    def tearDown(self):
-        self._sleep_patch.stop()
-
-    def _ok(self):
+    def _ok(self, status=200):
         resp = mock.MagicMock()
-        resp.status = 200
+        resp.status = status
         resp.__enter__.return_value = resp
         return resp
 
-    def test_unreachable_first_url_falls_back_without_waiting(self):
-        with mock.patch.object(
-            digest.urllib.request, "urlopen", side_effect=[urllib.error.URLError("down"), self._ok()]
-        ) as m:
-            self.assertTrue(digest.post_to_apprise("http://a/notify/x http://b/notify/x", "t", "b"))
-        self.assertEqual([c.args[0].full_url for c in m.call_args_list], ["http://a/notify/x", "http://b/notify/x"])
-        self.sleep.assert_not_called()
+    def _post(self, url, side_effect):
+        with mock.patch.object(apprise_notify.urllib.request, "urlopen", side_effect=side_effect) as m:
+            result = digest.post_to_apprise(url, "t", "b")
+        return result, [c.args[0].full_url for c in m.call_args_list], m
 
-    def test_http_error_moves_to_the_next_url_and_is_not_retried(self):
-        err = urllib.error.HTTPError("url", 500, "Internal Server Error", {}, None)
-        with mock.patch.object(
-            digest.urllib.request, "urlopen", side_effect=[err, urllib.error.URLError("down"), self._ok()]
-        ) as m:
-            self.assertTrue(digest.post_to_apprise("http://a/notify/x http://b/notify/x", "t", "b"))
-        # a (500) dropped, b unreachable, then the next attempt tries only b
-        self.assertEqual(
-            [c.args[0].full_url for c in m.call_args_list],
-            ["http://a/notify/x", "http://b/notify/x", "http://b/notify/x"],
-        )
+    def test_sends_an_html_info_notification_with_a_generous_timeout(self):
+        ok, calls, m = self._post(self.A, [self._ok()])
+        self.assertTrue(ok)
+        self.assertEqual(calls, [self.A])
+        req = m.call_args.args[0]
+        self.assertEqual(json.loads(req.data), {"title": "t", "body": "b", "type": "info", "format": "html"})
+        self.assertEqual(m.call_args.kwargs["timeout"], digest._APPRISE_POST_TIMEOUT_SECONDS)
 
-    def test_every_url_rejecting_fails_at_once(self):
+    def test_retries_a_transient_network_error_then_succeeds(self):
+        ok, calls, _ = self._post(self.A, [urllib.error.URLError("cold path"), self._ok()])
+        self.assertTrue(ok)
+        self.assertEqual(calls, [self.A, self.A])
+
+    def test_unreachable_first_url_falls_back_to_the_next(self):
+        down = urllib.error.URLError("down")
+        ok, calls, _ = self._post(f"{self.A} {self.B}", [down, down, self._ok()])
+        self.assertTrue(ok)
+        self.assertEqual(calls, [self.A, self.A, self.B])
+
+    def test_client_error_moves_to_the_next_url_without_a_retry(self):
+        err = urllib.error.HTTPError("url", 400, "Bad Request", {}, None)
+        ok, calls, _ = self._post(f"{self.A} {self.B}", [err, self._ok()])
+        self.assertTrue(ok)
+        self.assertEqual(calls, [self.A, self.B])
+
+    def test_no_configuration_204_moves_to_the_next_url(self):
+        ok, calls, _ = self._post(f"{self.A} {self.B}", [self._ok(204), self._ok()])
+        self.assertTrue(ok)
+        self.assertEqual(calls, [self.A, self.B])
+
+    def test_first_delivery_wins(self):
+        ok, calls, _ = self._post(f"{self.A} {self.B}", [self._ok()])
+        self.assertTrue(ok)
+        self.assertEqual(calls, [self.A])
+
+    def test_every_url_failing_returns_false(self):
         err = urllib.error.HTTPError("url", 500, "Internal Server Error", {}, None)
-        with mock.patch.object(digest.urllib.request, "urlopen", side_effect=[err, err]) as m:
-            self.assertFalse(digest.post_to_apprise("http://a/notify/x http://b/notify/x", "t", "b"))
-        self.assertEqual(m.call_count, 2)
-        self.sleep.assert_not_called()
+        ok, calls, _ = self._post(f"{self.A} {self.B}", [err] * 4)
+        self.assertFalse(ok)
+        self.assertEqual(calls, [self.A, self.A, self.B, self.B])
 
 
 class TestWithPreview(unittest.TestCase):
@@ -687,53 +710,6 @@ class TestLookbackHoursValidation(unittest.TestCase):
     def test_positive_is_accepted(self):
         result = self._import_with_env("48")
         self.assertEqual(result.returncode, 0, result.stderr)
-
-
-class TestPostToAppriseRetry(unittest.TestCase):
-    def setUp(self):
-        self._sleep_patch = mock.patch.object(digest.time, "sleep")
-        self._sleep_patch.start()
-
-    def tearDown(self):
-        self._sleep_patch.stop()
-
-    def test_succeeds_without_retry(self):
-        resp = mock.MagicMock()
-        resp.status = 200
-        resp.__enter__.return_value = resp
-        with mock.patch.object(digest.urllib.request, "urlopen", return_value=resp) as m:
-            self.assertTrue(digest.post_to_apprise("http://apprise/notify", "t", "b"))
-            self.assertEqual(m.call_count, 1)
-
-    def test_retries_on_transient_network_error_then_succeeds(self):
-        resp = mock.MagicMock()
-        resp.status = 200
-        resp.__enter__.return_value = resp
-        with mock.patch.object(
-            digest.urllib.request,
-            "urlopen",
-            side_effect=[urllib.error.URLError("cold path"), resp],
-        ) as m:
-            self.assertTrue(digest.post_to_apprise("http://apprise/notify", "t", "b"))
-            self.assertEqual(m.call_count, 2)
-
-    def test_gives_up_after_max_attempts(self):
-        with mock.patch.object(
-            digest.urllib.request,
-            "urlopen",
-            side_effect=urllib.error.URLError("still cold"),
-        ) as m:
-            self.assertFalse(digest.post_to_apprise("http://apprise/notify", "t", "b"))
-            self.assertEqual(m.call_count, digest._APPRISE_POST_MAX_ATTEMPTS)
-
-    def test_http_error_is_not_retried(self):
-        with mock.patch.object(
-            digest.urllib.request,
-            "urlopen",
-            side_effect=urllib.error.HTTPError("url", 500, "Internal Server Error", {}, None),
-        ) as m:
-            self.assertFalse(digest.post_to_apprise("http://apprise/notify", "t", "b"))
-            self.assertEqual(m.call_count, 1)
 
 
 class TestSnapshotDb(unittest.TestCase):

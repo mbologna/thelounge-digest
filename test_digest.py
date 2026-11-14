@@ -742,5 +742,190 @@ class TestSnapshotDb(unittest.TestCase):
                 digest.snapshot_db(missing)
 
 
+class TestNetworkUuids(unittest.TestCase):
+    def test_maps_names_to_uuids(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "user.json")
+            with open(path, "w") as f:
+                json.dump({"networks": [{"name": "Net", "uuid": "u-1"}, {"name": "NoUuid"}]}, f)
+            with mock.patch.object(digest, "THELOUNGE_USERS_JSON", path):
+                self.assertEqual(digest.load_network_uuids(), {"Net": "u-1"})
+
+    def test_unreadable_file_gives_empty_map(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing = os.path.join(tmpdir, "missing.json")
+            with mock.patch.object(digest, "THELOUNGE_USERS_JSON", missing), mock.patch("sys.stderr"):
+                self.assertEqual(digest.load_network_uuids(), {})
+
+
+class TestCursor(unittest.TestCase):
+    def test_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "sub", "cursor.json")
+            with mock.patch.object(digest, "CURSOR_FILE", path), mock.patch("sys.stdout"):
+                self.assertEqual(digest.load_cursor(), {})
+                digest.save_cursor({"Net/#chan": 7})
+                self.assertEqual(digest.load_cursor(), {"Net/#chan": 7})
+            self.assertEqual(os.listdir(os.path.dirname(path)), ["cursor.json"])
+
+    def test_invalid_json_gives_empty_cursor(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "cursor.json")
+            with open(path, "w") as f:
+                f.write("{not json")
+            with mock.patch.object(digest, "CURSOR_FILE", path), mock.patch("sys.stderr"):
+                self.assertEqual(digest.load_cursor(), {})
+
+    def test_failed_write_removes_temp_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "cursor.json")
+            with mock.patch.object(digest, "CURSOR_FILE", path), self.assertRaises(TypeError):
+                digest.save_cursor({"bad": object()})
+            self.assertEqual(os.listdir(tmpdir), [])
+
+
+class TestFetchMessagesChannelOnly(unittest.TestCase):
+    def test_without_uuid_filters_by_channel_and_skips_bad_json(self):
+        conn = _make_db([(1, "u-1", "#chan", 1000, "message", "alice", "hi")])
+        conn.execute("INSERT INTO messages VALUES (2, 'u-2', '#chan', 2000, 'message', 'not json')")
+        with mock.patch("sys.stderr"):
+            msgs = digest.fetch_messages(conn, "#chan", 0)
+        self.assertEqual([m["id"] for m in msgs], [1])
+        self.assertEqual(msgs[0]["nick"], "alice")
+
+
+class TestMain(unittest.TestCase):
+    """main() end to end against a throwaway database, with delivery stubbed."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        tmpdir = self._tmp.name
+        self.db_path = os.path.join(tmpdir, "logs.sqlite3")
+        self.users_path = os.path.join(tmpdir, "user.json")
+        self.cursor_path = os.path.join(tmpdir, "data", "cursor.json")
+        with open(self.users_path, "w") as f:
+            json.dump({"networks": [{"name": "Net", "uuid": "u-1"}]}, f)
+        now_ms = int(datetime.now().timestamp() * 1000)
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, network TEXT, channel TEXT, "
+            "time INTEGER, type TEXT, msg TEXT)"
+        )
+        rows = [
+            (1, "u-1", "#one", now_ms - 1000, "message", "alice", "see https://example.com/a"),
+            (2, "u-1", "#two", now_ms - 900, "message", "bob", "also https://example.com/a here"),
+            (3, "u-1", "#two", now_ms - 800, "message", "carol", "the Kernel release is out"),
+            (4, "u-9", "#other", now_ms - 700, "message", "dave", "hello"),
+        ]
+        conn.executemany(
+            "INSERT INTO messages VALUES (?,?,?,?,?,?)",
+            [(r[0], r[1], r[2], r[3], r[4], json.dumps({"from": {"nick": r[5]}, "text": r[6]})) for r in rows],
+        )
+        conn.commit()
+        conn.close()
+        self._patches = [
+            mock.patch.object(digest, "THELOUNGE_DB", self.db_path),
+            mock.patch.object(digest, "THELOUNGE_USERS_JSON", self.users_path),
+            mock.patch.object(digest, "CURSOR_FILE", self.cursor_path),
+            mock.patch.object(digest, "DIGEST_CHANNELS", "Net/#one, Net/#two, Other/#other, bogus"),
+            mock.patch.object(digest, "DIGEST_KEYWORDS", "kernel"),
+            mock.patch.object(digest, "APPRISE_URL", "http://apprise.invalid/notify/x"),
+            mock.patch.object(digest, "APPRISE_POST_DELAY_SECONDS", 0),
+            mock.patch("sys.stdout"),
+            mock.patch("sys.stderr"),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in reversed(self._patches):
+            p.stop()
+        self._tmp.cleanup()
+
+    def _run(self, *args):
+        with mock.patch.object(sys, "argv", ["digest.py", *args]):
+            digest.main()
+
+    def _cursor(self):
+        with open(self.cursor_path) as f:
+            return json.load(f)
+
+    def test_sends_digest_then_trending_preview_and_saves_cursor(self):
+        with mock.patch.object(digest, "post_to_apprise", return_value=True) as post:
+            self._run()
+        titles = [c.args[1] for c in post.call_args_list]
+        self.assertEqual(titles, ["The Lounge Digest", "Trending link"])
+        body = post.call_args_list[0].args[2]
+        self.assertIn("Net/#one", body)
+        self.assertIn("Keyword matches", body)
+        self.assertIn("preview=no", post.call_args_list[0].args[0])
+        self.assertIn("preview=yes", post.call_args_list[1].args[0])
+        self.assertEqual(self._cursor(), {"Net/#one": 1, "Net/#two": 3, "Other/#other": 4})
+
+    def test_large_digest_is_sent_in_numbered_chunks(self):
+        with (
+            mock.patch.object(digest, "chunk_body", return_value=["a", "b"]),
+            mock.patch.object(digest, "post_to_apprise", return_value=True) as post,
+        ):
+            self._run()
+        titles = [c.args[1] for c in post.call_args_list]
+        self.assertEqual(titles[:2], ["The Lounge Digest (1/2)", "The Lounge Digest (2/2)"])
+
+    def test_failed_delivery_exits_and_keeps_cursor(self):
+        with mock.patch.object(digest, "post_to_apprise", return_value=False), self.assertRaises(SystemExit) as cm:
+            self._run()
+        self.assertEqual(cm.exception.code, 1)
+        self.assertFalse(os.path.exists(self.cursor_path))
+
+    def test_failed_preview_only_warns(self):
+        with mock.patch.object(digest, "post_to_apprise", side_effect=[True, False]):
+            self._run()
+        self.assertTrue(os.path.exists(self.cursor_path))
+
+    def test_dry_run_sends_nothing(self):
+        with mock.patch.object(digest, "post_to_apprise") as post:
+            self._run("--dry-run")
+        post.assert_not_called()
+        self.assertFalse(os.path.exists(self.cursor_path))
+
+    def test_init_primes_cursor_without_sending(self):
+        with mock.patch.object(digest, "post_to_apprise") as post:
+            self._run("--init")
+        post.assert_not_called()
+        self.assertEqual(self._cursor(), {"Net/#one": 1, "Net/#two": 3, "Other/#other": 4})
+
+    def test_nothing_new_exits_cleanly(self):
+        os.makedirs(os.path.dirname(self.cursor_path))
+        with open(self.cursor_path, "w") as f:
+            json.dump({"Net/#one": 1, "Net/#two": 3, "Other/#other": 4}, f)
+        with mock.patch.object(digest, "post_to_apprise") as post, self.assertRaises(SystemExit) as cm:
+            self._run()
+        self.assertEqual(cm.exception.code, 0)
+        post.assert_not_called()
+
+    def test_missing_channels_is_an_error(self):
+        with mock.patch.object(digest, "DIGEST_CHANNELS", ""), self.assertRaises(SystemExit) as cm:
+            self._run()
+        self.assertEqual(cm.exception.code, 1)
+
+    def test_no_valid_channel_pair_is_an_error(self):
+        with mock.patch.object(digest, "DIGEST_CHANNELS", "bogus, ,"), self.assertRaises(SystemExit) as cm:
+            self._run()
+        self.assertEqual(cm.exception.code, 1)
+
+    def test_missing_apprise_url_is_an_error(self):
+        with mock.patch.object(digest, "APPRISE_URL", ""), self.assertRaises(SystemExit) as cm:
+            self._run()
+        self.assertEqual(cm.exception.code, 1)
+
+    def test_unreadable_database_is_an_error(self):
+        with (
+            mock.patch.object(digest, "THELOUNGE_DB", self.db_path + ".missing"),
+            self.assertRaises(SystemExit) as cm,
+        ):
+            self._run()
+        self.assertEqual(cm.exception.code, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

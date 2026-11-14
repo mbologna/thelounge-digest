@@ -48,4 +48,6 @@ jobs:
       # auto-release runs inside docker-ci: Monday's schedule releases with
       # this strategy, a push to main only a CVE fix.
       release_strategy: conventional
+      # Importing the script proves the image's Python and dependencies load.
+      smoke_cmd: python -c 'import digest'
     secrets: inherit

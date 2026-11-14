@@ -38,3 +38,6 @@ addopts = "-v --strict-markers"
 
 [tool.coverage.run]
 source = ["digest"]
+
+[tool.coverage.report]
+fail_under = 96

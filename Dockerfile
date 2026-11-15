@@ -29,5 +29,10 @@ COPY digest.py .
 # The Lounge's own UID in its official image, so the read-only mount of its
 # home is readable; /data (the cursor) must be writable by it. Snapshots go
 # to /tmp.
+# The distribution's security fixes published since the base image was
+# built: Docker's official images are rebuilt only every week or few.
+# auto-release's fresh rebuild counts the base image's findings because of
+# this line, so a fix ships within a week without a base image update.
+RUN apk upgrade --no-cache
 USER 1000:1000
 CMD ["python", "/app/digest.py"]

@@ -2,98 +2,156 @@
 
 [![CI](https://github.com/mbologna/thelounge-digest/actions/workflows/ci.yml/badge.svg)](https://github.com/mbologna/thelounge-digest/actions/workflows/ci.yml)
 
-Periodic IRC digest notifier for [TheLounge](https://thelounge.chat). Reads
-new messages directly from TheLounge's sqlite logs since the last run, and
-POSTs a formatted HTML digest to an [Apprise](https://github.com/caronc/apprise-api)
-endpoint — nick-colored, grouped by consecutive author, with trending links
-and keyword highlights pulled out into their own sections.
+thelounge-digest sends a periodic digest of IRC channels logged by
+[The Lounge](https://thelounge.chat/), for its users who would rather read
+a summary than follow the channels live. Each run reads the messages posted
+since the previous run from The Lounge's [SQLite](https://sqlite.org/) log
+and posts them as one HTML message to an
+[Apprise API](https://github.com/caronc/apprise-api) server: nicks
+coloured, consecutive lines from one author grouped, links seen in several
+channels and keyword matches pulled out into their own sections. Run it on
+a schedule.
 
-## How it works
+## What a run does
 
-Each run:
+1. Copies the live database to a snapshot in `/tmp` with SQLite's backup
+   API and queries the snapshot. The Lounge keeps its database in
+   rollback-journal mode, so a long read on the live file would block its
+   writes for the whole run; the copy holds the lock for seconds.
+2. For each `Network/#channel` in `DIGEST_CHANNELS`, reads the messages,
+   notices, actions, topic changes and kicks newer than that channel's saved
+   cursor and no older than `DIGEST_LOOKBACK_HOURS`. The window stops a new
+   channel or a cursor that fell behind from dumping its whole backlog into
+   one digest; older messages are skipped and the cursor moves past them.
+3. Collects trending links: URLs posted in at least two channels, ignoring
+   your own messages and those of the nicks in `DIGEST_BOTS`.
+4. Collects messages containing any of `DIGEST_KEYWORDS` (case-insensitive)
+   and highlights the keyword in bold.
+5. Builds the digest: a one-line count of messages, channels, trending links
+   and keyword matches when more than one channel has news, then one section
+   per channel, then the trending links and keyword matches. Nick colours
+   follow The Lounge's own colour assignment; bots, your own messages,
+   actions and notices are set apart. If nothing is new, the run sends
+   nothing and exits 0.
+6. Posts the digest, titled `The Lounge Digest`, split into chunks of at
+   most 4,000 characters (under [Telegram](https://telegram.org/)'s message
+   limit) with `APPRISE_POST_DELAY_SECONDS` between posts to avoid flood
+   control. When there are trending links, the digest goes out with link
+   previews off and each trending link follows as its own `Trending link`
+   message with the preview on. Posting goes through
+   [apprise-notify](https://pypi.org/project/apprise-notify/), which retries
+   a URL once on a network error or HTTP 5xx before moving to the next.
+7. Saves the new cursors, and only if every digest chunk was delivered: a
+   failed delivery exits 1 and the next run sends the same messages again. A
+   failed trending-link message is only a warning.
 
-1. Takes a sqlite backup-API snapshot of the live TheLounge DB (so it never
-   holds a read lock on the file TheLounge itself is writing to).
-2. For each configured `Network/#channel`, fetches messages newer than that
-   channel's saved cursor, capped to the last `DIGEST_LOOKBACK_HOURS` so a
-   stuck cursor or a brand-new channel can never dump its whole history into
-   one digest.
-3. Finds links posted in ≥2 different channels by a human (not the bot
-   accounts, not your own messages) and surfaces them as "trending".
-4. Finds messages matching any configured keyword.
-5. When more than one channel has new activity, prepends a one-line summary
-   (message/channel/trending/keyword counts) so the digest is skimmable at a
-   glance.
-6. POSTs the digest to Apprise, chunked to stay under Telegram's message size
-   limit, with a short delay between chunks to avoid flood control. The
-   [apprise-notify](https://github.com/mbologna/apprise-notify-py) client
-   retries each URL once on a network error or HTTP 5xx (e.g. a cold
-   cross-cluster path), then moves on to the next URL before giving up.
-7. Saves the new cursor — only after a successful delivery.
-
-It reads TheLounge's `messages` table directly:
-
-```
-messages(id, network TEXT, channel TEXT, time INTEGER, type TEXT, msg TEXT)
-```
-
-where `network` is a UUID (not a human-readable name) and `msg` is a JSON
-blob. The UUID → network-name mapping comes from TheLounge's own
-`users/<user>.json`, so that identically-named channels on different networks
-(e.g. `#linux` on two different IRC networks) are kept separate.
+The Lounge stores each message's network as a UUID. The digest maps network
+names to UUIDs through The Lounge's `users/<user>.json`, so channels with the
+same name on two networks stay apart. If a network name is not found there,
+the run warns and matches on the channel name alone.
 
 ## Configuration
 
-All configuration is via environment variables:
+All settings are environment variables.
 
-| Variable | Required | Default | Description |
+| Variable | Required | Default | Meaning |
 |---|---|---|---|
-| `DIGEST_CHANNELS` | yes | — | Comma-separated `Network/#channel` pairs, e.g. `Libera/#chan,Libera/##other` |
-| `APPRISE_URL` | yes* | — | Apprise notify endpoint to POST the digest to (*not required for `--dry-run`/`--init`). Several whitespace-separated URLs serving the same tag are tried in order until one delivers, so a second Apprise instance can be the fallback |
-| `DIGEST_BOTS` | no | `""` | Comma-separated bot nicks — rendered distinctly and excluded from nick colors and trending-link detection |
-| `DIGEST_KEYWORDS` | no | `""` | Comma-separated keywords to highlight/surface in a dedicated section |
-| `THELOUNGE_DB` | no | `/thelounge/logs/<user>.sqlite3` | Path to TheLounge's sqlite log DB |
-| `THELOUNGE_USERS_JSON` | no | `/thelounge/users/<user>.json` | Path to TheLounge's per-user network config (for the UUID → name mapping) |
-| `CURSOR_FILE` | no | `/data/cursor.json` | Where per-channel last-seen message IDs are persisted between runs |
-| `DIGEST_LOOKBACK_HOURS` | no | `24` | Max backlog age included in a single digest |
-| `APPRISE_POST_DELAY_SECONDS` | no | `1.5` | Delay between consecutive Apprise POSTs (chunked digests, trending-link previews) |
+| `DIGEST_CHANNELS` | yes | | Comma-separated `Network/#channel` pairs, with the network names The Lounge shows, such as `Libera/#chan,Libera/##other` |
+| `APPRISE_URL` | yes, except with `--init` or `--dry-run` | | Apprise API notify URL, such as `http://apprise:8000/notify/<key>`. Several whitespace-separated URLs for the same key are tried in order until one delivers, so a second Apprise server can be the fallback |
+| `DIGEST_BOTS` | no | empty | Comma-separated bot nicks: shown as bots, given no nick colour and ignored for trending links |
+| `DIGEST_KEYWORDS` | no | empty | Comma-separated keywords to highlight and list in their own section |
+| `THELOUNGE_DB` | no | `/thelounge/logs/michele.sqlite3` | The Lounge's SQLite log for your user, `logs/<user>.sqlite3` in its home |
+| `THELOUNGE_USERS_JSON` | no | `/thelounge/users/michele.json` | The Lounge's configuration for your user, `users/<user>.json`, read for the network UUIDs |
+| `CURSOR_FILE` | no | `/data/cursor.json` | Last message ID seen per channel, kept between runs |
+| `DIGEST_LOOKBACK_HOURS` | no | `24` | Oldest message a digest may include, in hours (a positive integer) |
+| `APPRISE_POST_DELAY_SECONDS` | no | `1.5` | Pause between consecutive Apprise posts |
+| `TZ` | no | `UTC` | Time zone of the timestamps in the digest |
 
-## CLI flags
+The two path defaults name the author's user; set them to your own.
 
-- `--init` — seed the cursor to the current head of every configured channel
-  without sending anything. Run this once before the first scheduled run so
-  the first real digest doesn't include the entire channel history.
-- `--dry-run` — fetch and render the digest, print it to stdout, but skip the
-  Apprise POST and skip saving the cursor.
+## Command-line flags
 
-## Running
+- `--init` sets every configured channel's cursor to its newest message and
+  sends nothing. Run it once before the first scheduled run, or the first
+  digest holds up to `DIGEST_LOOKBACK_HOURS` of history.
+- `--dry-run` builds the digest and prints it to stdout without sending it
+  or saving the cursor.
+
+## Running it
+
+The image is `ghcr.io/mbologna/thelounge-digest`, built for linux/amd64 and
+linux/arm64 and tagged `X.Y.Z` and `X.Y` for each release and `latest` for
+the newest. Its entry point is the `thelounge-digest` console script, so
+flags go after the image name:
 
 ```sh
 docker run --rm \
   -e DIGEST_CHANNELS="Libera/#chan" \
-  -e APPRISE_URL="http://apprise:8000/notify/thelounge_notifications" \
+  -e THELOUNGE_DB=/thelounge/logs/alice.sqlite3 \
+  -e THELOUNGE_USERS_JSON=/thelounge/users/alice.json \
+  -e APPRISE_URL="http://apprise:8000/notify/irc" \
+  -e TZ=Europe/London \
   -v /path/to/thelounge:/thelounge:ro \
   -v /path/to/data:/data \
-  ghcr.io/mbologna/thelounge-digest:latest
+  ghcr.io/mbologna/thelounge-digest:latest --init
 ```
 
-The container runs as UID/GID 1000:1000, The Lounge's own user in its
-official image. The `/data` directory must be writable by that user
-(`chown 1000:1000 /path/to/data`); `--user` picks another one.
+Drop `--init` for the scheduled runs. A [systemd](https://systemd.io/) timer
+that runs the container with [Podman](https://podman.io/), or a Kubernetes
+[CronJob](https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/),
+both work.
 
-Images are built for linux/amd64 and linux/arm64. A systemd timer running the container with podman
-works well for periodic digests.
+The container runs as uid and gid 1000, The Lounge's user in its official
+image, so it can read The Lounge's home mounted read-only. The `/data`
+directory must be writable by that user (`chown 1000:1000 /path/to/data`),
+because the cursor is written to a temporary file there and renamed;
+`--user` picks another user. With a read-only root filesystem, mount a
+writable `/tmp` for the snapshot.
 
-## Tests
+Images up to 2.1.0 ran `python /app/digest.py`. Later images keep a small
+script at that path that runs the same code, so a deployment that still
+calls it works; switch it to `thelounge-digest`, as the shim will be removed.
+
+## Development
+
+The project uses [uv](https://docs.astral.sh/uv/) and Python 3.15, the
+version in the image. The code is in `src/thelounge_digest/`.
 
 ```sh
-uv run pytest
+uv sync
+uv run pytest --cov
+uv run ruff check . && uv run ruff format --check .
+uv run pre-commit install        # once
+uv run pre-commit run --all-files
+uv run thelounge-digest --dry-run   # needs DIGEST_CHANNELS and THELOUNGE_*
 ```
 
-## Dependency updates
+`pytest --cov` fails below the coverage floor, `fail_under` in
+`pyproject.toml`. The [pre-commit](https://pre-commit.com/) hooks add
+[ruff](https://docs.astral.sh/ruff/), [mypy](https://mypy-lang.org/),
+[bandit](https://bandit.readthedocs.io/) and
+[hadolint](https://github.com/hadolint/hadolint) to the usual file checks.
 
-`uv` resolves only package releases at least 7 days old (`exclude-newer` in
-`pyproject.toml`), so a compromised release has time to be caught before it
-lands in `uv.lock`. A CVE fix released less than 7 days ago needs a temporary
-override, e.g. `exclude-newer-package = { pytest = false }` under
-`[tool.uv]`; remove it once the release is a week old.
+Dependencies resolve only to releases at least 7 days old (`exclude-newer`
+in `pyproject.toml`), and the image installs exactly what `uv.lock` pins.
+To take a CVE fix released less than 7 days ago, add the package to
+`exclude-newer-package` as `<name> = false`, run `uv lock`, and remove the
+entry once the release is a week old.
+
+CI runs the reusable `python-ci` and `docker-ci` workflows from
+[mbologna/.github](https://github.com/mbologna/.github): ruff, the tests
+with the coverage gate, pip-audit, then the image build and a smoke test.
+Pull requests build the image without pushing it. Releases are `vX.Y.Z`
+tags, cut on Mondays when `main` has gained a `feat`, `fix`, `perf`,
+`revert` or breaking [Conventional Commit](https://www.conventionalcommits.org/)
+since the last tag; runtime dependency updates ship in the same weekly
+release. Only a release tag publishes the image. The `version` in
+`pyproject.toml` stays `0.0.0`.
+
+The project skeleton comes from
+[python-app-template](https://github.com/mbologna/python-app-template)
+through [Copier](https://copier.readthedocs.io/) (`.copier-answers.yml`).
+
+## Licence
+
+[MIT](LICENSE)

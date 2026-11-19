@@ -1,4 +1,4 @@
-"""Tests for digest.py — run with: python -m unittest test_digest -v"""
+"""Tests for thelounge_digest.digest — run with: uv run pytest"""
 
 import importlib
 import json
@@ -14,9 +14,9 @@ from unittest import mock
 
 import apprise_notify
 
-# digest.py reads env vars and opens files at import time only inside main(),
+# The digest module reads env vars and opens files at import time only inside main(),
 # so a plain import is safe.
-import digest
+from thelounge_digest import digest
 
 
 def _make_db(rows):
@@ -690,8 +690,7 @@ class TestLookbackHoursValidation(unittest.TestCase):
     def _import_with_env(self, value):
         env = dict(os.environ, DIGEST_LOOKBACK_HOURS=value, DIGEST_CHANNELS="Net/#chan")
         return subprocess.run(
-            [sys.executable, "-c", "import digest"],
-            cwd=os.path.dirname(os.path.abspath(__file__)),
+            [sys.executable, "-c", "import thelounge_digest.digest"],
             env=env,
             capture_output=True,
             text=True,

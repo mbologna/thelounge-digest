@@ -1,8 +1,5 @@
 FROM python:3.15-alpine@sha256:0f9552bb28711333da16915ec146f5e6bb44a7fdac9ced15dc17c2e0206346dd AS build
 
-# git: apprise-notify is a git dependency. Installed into a virtualenv, so the
-# runtime stage needs neither git nor uv.
-RUN apk add --no-cache git
 # uv from PyPI, hash-checked (requirements-uv.txt says why).
 COPY requirements-uv.txt /tmp/
 RUN pip install --no-cache-dir --root-user-action=ignore --require-hashes -r /tmp/requirements-uv.txt

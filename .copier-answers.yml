@@ -1,0 +1,17 @@
+# Copier's record of this project's template answers. Don't edit by hand:
+# `copier update` (or Renovate's copier manager) reads it to apply
+# template changes.
+_commit: v1.1.3
+_src_path: https://github.com/mbologna/python-app-template.git
+author: Michele Bologna
+base_variant: alpine
+coverage_fail_under: 96
+description: 'Scheduled IRC digests for TheLounge: reads its SQLite logs and sends
+    nick-coloured HTML digests with trending links and keyword highlights through
+    Apprise'
+forge: github
+notifications: true
+package_name: thelounge_digest
+project_name: thelounge-digest
+sample_code: false
+smoke_cmd: python -c 'import thelounge_digest.digest'

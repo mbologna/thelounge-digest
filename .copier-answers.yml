@@ -29,3 +29,5 @@ sample_code: false
 script_target: thelounge_digest.digest:main
 smoke_cmd: python -c 'import thelounge_digest.digest'
 writable_dirs: ''
+
+#copier updated

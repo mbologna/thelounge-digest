@@ -36,11 +36,11 @@ a schedule.
 6. Posts the digest, titled `The Lounge Digest`, split into chunks of at
    most 4,000 characters (under [Telegram](https://telegram.org/)'s message
    limit) with `APPRISE_POST_DELAY_SECONDS` between posts to avoid flood
-   control. When there are trending links, the digest goes out with link
-   previews off and each trending link follows as its own `Trending link`
-   message with the preview on. Posting goes through
-   [apprise-notify](https://pypi.org/project/apprise-notify/), which retries
-   a URL once on a network error or HTTP 5xx before moving to the next.
+   control. Each trending link follows as its own `Trending link` message,
+   so it is the message's first link and Telegram can preview it. Posting
+   goes through the [apprise](https://github.com/caronc/apprise) library:
+   each URL in `APPRISE_URL` is its own priority group, so they are tried in
+   order, each retried once before the next.
 7. Saves the new cursors, and only if every digest chunk was delivered: a
    failed delivery exits 1 and the next run sends the same messages again. A
    failed trending-link message is only a warning.

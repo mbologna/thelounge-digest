@@ -1,5 +1,6 @@
 """Tests for thelounge_digest.digest — run with: uv run pytest"""
 
+import http.server
 import importlib
 import json
 import os
@@ -7,12 +8,10 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
-import urllib.error
 from datetime import date, datetime, time
 from unittest import mock
-
-import apprise_notify
 
 # The digest module reads env vars and opens files at import time only inside main(),
 # so a plain import is safe.
@@ -286,93 +285,94 @@ class TestChunkBody(unittest.TestCase):
         self.assertEqual(len(digest.chunk_body(body, max_len=4000)), 1)
 
 
-class TestPostToApprise(unittest.TestCase):
-    """post_to_apprise hands the URLs to apprise-notify: tried in order, first delivery wins."""
+class _StubApprise:
+    """A local Apprise API stand-in answering every POST with one status; records the requests."""
 
-    A, B = "http://a/notify/x", "http://b/notify/x"
+    def __init__(self, status):
+        calls = self.calls = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("content-length", 0))
+                calls.append((self.path, self.headers.get("content-type"), json.loads(self.rfile.read(length))))
+                self.send_response(status)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.server.server_port}/notify/digest-key"
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class TestPostToApprise(unittest.TestCase):
+    """post_to_apprise tries the URLs in order through apprise: first delivery wins."""
 
     def setUp(self):
-        patch = mock.patch.object(apprise_notify, "RETRY_DELAY", 0)
+        patch = mock.patch.object(digest, "_APPRISE_RETRY_WAIT_SECONDS", 0)
         patch.start()
         self.addCleanup(patch.stop)
 
-    def _ok(self, status=200):
-        resp = mock.MagicMock()
-        resp.status = status
-        resp.__enter__.return_value = resp
-        return resp
+    def stub(self, status):
+        server = _StubApprise(status)
+        self.addCleanup(server.close)
+        return server
 
-    def _post(self, url, side_effect):
-        with mock.patch.object(apprise_notify.urllib.request, "urlopen", side_effect=side_effect) as m:
-            result = digest.post_to_apprise(url, "t", "b")
-        return result, [c.args[0].full_url for c in m.call_args_list], m
+    def test_sends_an_html_info_notification_as_json_to_the_key(self):
+        ok = self.stub(200)
+        self.assertTrue(digest.post_to_apprise(ok.url, "t", "<b>b</b>"))
+        self.assertEqual(
+            ok.calls,
+            [
+                (
+                    "/notify/digest-key",
+                    "application/json",
+                    {"title": "t", "body": "<b>b</b>", "type": "info", "format": "html"},
+                )
+            ],
+        )
 
-    def test_sends_an_html_info_notification_with_a_generous_timeout(self):
-        ok, calls, m = self._post(self.A, [self._ok()])
-        self.assertTrue(ok)
-        self.assertEqual(calls, [self.A])
-        req = m.call_args.args[0]
-        self.assertEqual(json.loads(req.data), {"title": "t", "body": "b", "type": "info", "format": "html"})
-        self.assertEqual(m.call_args.kwargs["timeout"], digest._APPRISE_POST_TIMEOUT_SECONDS)
+    def test_a_failing_url_is_retried_once_then_the_next_delivers(self):
+        down, ok = self.stub(500), self.stub(200)
+        self.assertTrue(digest.post_to_apprise(f"{down.url} {ok.url}", "t", "b"))
+        self.assertEqual((len(down.calls), len(ok.calls)), (2, 1))
 
-    def test_retries_a_transient_network_error_then_succeeds(self):
-        ok, calls, _ = self._post(self.A, [urllib.error.URLError("cold path"), self._ok()])
-        self.assertTrue(ok)
-        self.assertEqual(calls, [self.A, self.A])
-
-    def test_unreachable_first_url_falls_back_to_the_next(self):
-        down = urllib.error.URLError("down")
-        ok, calls, _ = self._post(f"{self.A} {self.B}", [down, down, self._ok()])
-        self.assertTrue(ok)
-        self.assertEqual(calls, [self.A, self.A, self.B])
-
-    def test_client_error_moves_to_the_next_url_without_a_retry(self):
-        err = urllib.error.HTTPError("url", 400, "Bad Request", {}, None)
-        ok, calls, _ = self._post(f"{self.A} {self.B}", [err, self._ok()])
-        self.assertTrue(ok)
-        self.assertEqual(calls, [self.A, self.B])
-
-    def test_no_configuration_204_moves_to_the_next_url(self):
-        ok, calls, _ = self._post(f"{self.A} {self.B}", [self._ok(204), self._ok()])
-        self.assertTrue(ok)
-        self.assertEqual(calls, [self.A, self.B])
+    def test_no_configuration_204_counts_as_not_delivered(self):
+        empty, ok = self.stub(204), self.stub(200)
+        self.assertTrue(digest.post_to_apprise(f"{empty.url} {ok.url}", "t", "b"))
+        self.assertEqual(len(ok.calls), 1)
 
     def test_first_delivery_wins(self):
-        ok, calls, _ = self._post(f"{self.A} {self.B}", [self._ok()])
-        self.assertTrue(ok)
-        self.assertEqual(calls, [self.A])
+        ok, other = self.stub(200), self.stub(200)
+        self.assertTrue(digest.post_to_apprise(f"{ok.url} {other.url}", "t", "b"))
+        self.assertEqual((len(ok.calls), len(other.calls)), (1, 0))
 
     def test_every_url_failing_returns_false(self):
-        err = urllib.error.HTTPError("url", 500, "Internal Server Error", {}, None)
-        ok, calls, _ = self._post(f"{self.A} {self.B}", [err] * 4)
-        self.assertFalse(ok)
-        self.assertEqual(calls, [self.A, self.A, self.B, self.B])
+        a, b = self.stub(500), self.stub(500)
+        self.assertFalse(digest.post_to_apprise(f"{a.url} {b.url}", "t", "b"))
+        self.assertEqual((len(a.calls), len(b.calls)), (2, 2))
+
+    def test_no_url_returns_false(self):
+        self.assertFalse(digest.post_to_apprise("", "t", "b"))
 
 
-class TestWithPreview(unittest.TestCase):
-    BASE = "http://apprise/notify/abc"
+class TestAppriseApiUrl(unittest.TestCase):
+    def test_http_endpoint(self):
+        self.assertEqual(
+            digest.apprise_api_url("http://apprise-hotel.tail.ts.net:8000/notify/thelounge", timeout=90),
+            "apprise://apprise-hotel.tail.ts.net:8000/thelounge?method=json&version=1&retry=1&wait=1&rto=90",
+        )
 
-    def test_adds_preview_yes(self):
-        url = digest.with_preview(self.BASE, enabled=True)
-        self.assertIn("preview=yes", url)
-
-    def test_adds_preview_no(self):
-        url = digest.with_preview(self.BASE, enabled=False)
-        self.assertIn("preview=no", url)
-
-    def test_replaces_existing_param(self):
-        url = digest.with_preview(self.BASE + "?preview=yes", enabled=False)
-        self.assertIn("preview=no", url)
-        self.assertEqual(url.count("preview="), 1)
-
-    def test_preserves_other_params(self):
-        url = digest.with_preview(self.BASE + "?token=xyz", enabled=True)
-        self.assertIn("token=xyz", url)
-        self.assertIn("preview=yes", url)
-
-    def test_every_fallback_url_gets_it(self):
-        url = digest.with_preview(self.BASE + " http://other/notify/abc", enabled=False)
-        self.assertEqual(url, "http://apprise/notify/abc?preview=no http://other/notify/abc?preview=no")
+    def test_https_and_a_path_prefix(self):
+        self.assertEqual(
+            digest.apprise_api_url("https://example.org/apprise/notify/k?preview=no", timeout=5),
+            "apprises://example.org/apprise/k?method=json&version=1&retry=1&wait=1&rto=5",
+        )
 
 
 class TestFormatSpan(unittest.TestCase):
@@ -849,7 +849,7 @@ class TestMain(unittest.TestCase):
         with open(self.cursor_path) as f:
             return json.load(f)
 
-    def test_sends_digest_then_trending_preview_and_saves_cursor(self):
+    def test_sends_digest_then_trending_link_and_saves_cursor(self):
         with mock.patch.object(digest, "post_to_apprise", return_value=True) as post:
             self._run()
         titles = [c.args[1] for c in post.call_args_list]
@@ -857,8 +857,7 @@ class TestMain(unittest.TestCase):
         body = post.call_args_list[0].args[2]
         self.assertIn("Net/#one", body)
         self.assertIn("Keyword matches", body)
-        self.assertIn("preview=no", post.call_args_list[0].args[0])
-        self.assertIn("preview=yes", post.call_args_list[1].args[0])
+        self.assertEqual({c.args[0] for c in post.call_args_list}, {digest.APPRISE_URL})
         self.assertEqual(self._cursor(), {"Net/#one": 1, "Net/#two": 3, "Other/#other": 4})
 
     def test_large_digest_is_sent_in_numbered_chunks(self):

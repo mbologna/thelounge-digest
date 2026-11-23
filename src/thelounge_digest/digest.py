@@ -25,7 +25,7 @@ import time
 import urllib.parse
 from datetime import datetime
 
-from apprise_notify import notify
+import apprise
 
 # ---------------------------------------------------------------------------
 # Configuration from environment variables
@@ -460,21 +460,6 @@ def format_channel_section(network, channel, messages, nick_colors):
     return "\n".join(lines).rstrip()
 
 
-def with_preview(url, enabled: bool) -> str:
-    """Return the Apprise URL with the ?preview= parameter forced to yes/no.
-
-    Several whitespace-separated URLs (APPRISE_URL's fallbacks) each get it."""
-    return " ".join(_with_preview_one(u, enabled) for u in url.split())
-
-
-def _with_preview_one(url, enabled: bool) -> str:
-    parsed = urllib.parse.urlparse(url)
-    params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
-    params["preview"] = ["yes" if enabled else "no"]
-    new_query = urllib.parse.urlencode({k: v[0] for k, v in params.items()})
-    return parsed._replace(query=new_query).geturl()
-
-
 def chunk_body(body, max_len=4000):
     """Split body into chunks of at most max_len characters, breaking on newlines."""
     if len(body) <= max_len:
@@ -499,18 +484,37 @@ def chunk_body(body, max_len=4000):
 # Generous: Apprise answers only once it has handed the digest to every service
 # behind the tag, and the path to it may cross a cold tailnet link.
 _APPRISE_POST_TIMEOUT_SECONDS = 90
+# Seconds before the one retry of an Apprise URL.
+_APPRISE_RETRY_WAIT_SECONDS = 1
+
+
+def apprise_api_url(url, timeout=_APPRISE_POST_TIMEOUT_SECONDS):
+    """The apprise library's URL for an Apprise API endpoint, http(s)://host:port/notify/<key>.
+
+    JSON to /notify/<key> (version=1), as the relay and the other instance expect,
+    with one retry and the given read timeout. Any query on the URL is dropped."""
+    parsed = urllib.parse.urlsplit(url)
+    scheme = "apprises" if parsed.scheme == "https" else "apprise"
+    prefix, _, key = parsed.path.rpartition("/notify/")
+    path = f"{prefix.strip('/')}/{key}".lstrip("/")
+    return f"{scheme}://{parsed.netloc}/{path}?method=json&version=1&retry=1&wait={_APPRISE_RETRY_WAIT_SECONDS}&rto={timeout}"
 
 
 def post_to_apprise(url, title, body):
     """POST digest to Apprise. Returns True on success.
 
     url may hold several whitespace-separated Apprise URLs serving the same tag (a
-    second instance as the fallback). apprise-notify tries them in order: the first
-    that delivers wins, a network error or HTTP 5xx is retried once before moving on,
-    and failures are printed to stderr."""
+    second instance as the fallback). Each becomes its own apprise priority group,
+    so they are tried in order: the first that delivers wins, and each is retried
+    once before the next is tried. Failures are logged by apprise."""
     urls = url.split()
     print(f"POSTing digest to Apprise ({len(urls)} URL(s), tried in order) ...")
-    return notify(urls, title, body, type_="info", timeout=_APPRISE_POST_TIMEOUT_SECONDS, format_="html")
+    notifier = apprise.Apprise()
+    for priority, one in enumerate(urls, start=1):
+        notifier.add(apprise_api_url(one), tag=f"{priority}:digest")
+    if not len(notifier):
+        return False
+    return bool(notifier.notify(title=title, body=body, notify_type="info", body_format="html", tag="digest"))
 
 
 def main():
@@ -673,10 +677,9 @@ def main():
             print("Dry-run mode: digest not sent and cursor not updated.")
             return
 
-        # Send the digest without link previews (body may contain many URLs and
-        # Telegram would pick an arbitrary one). If there are trending links, a
-        # second message follows with just the top link so Telegram previews it.
-        digest_url = with_preview(APPRISE_URL, enabled=False) if trending_urls else APPRISE_URL
+        # The digest, then one message per trending link, so each link is the
+        # message's first and Telegram can preview it.
+        digest_url = APPRISE_URL
         body_chunks = chunk_body(body)
         for i, chunk in enumerate(body_chunks):
             if i > 0:
@@ -693,11 +696,7 @@ def main():
             time.sleep(APPRISE_POST_DELAY_SECONDS)
             chan_names = ", ".join(sorted(chans))
             preview_body = f'<a href="{url}">{html_module.escape(url)}</a>\n<i>({html_module.escape(chan_names)})</i>'
-            preview_success = post_to_apprise(
-                with_preview(APPRISE_URL, enabled=True),
-                "Trending link",
-                preview_body,
-            )
+            preview_success = post_to_apprise(APPRISE_URL, "Trending link", preview_body)
             if not preview_success:
                 print(f"Warning: failed to deliver trending link preview for {url}", file=sys.stderr)
 

@@ -492,12 +492,17 @@ def apprise_api_url(url, timeout=_APPRISE_POST_TIMEOUT_SECONDS):
     """The apprise library's URL for an Apprise API endpoint, http(s)://host:port/notify/<key>.
 
     JSON to /notify/<key> (version=1), as the relay and the other instance expect,
-    with one retry and the given read timeout. Any query on the URL is dropped."""
+    with one retry. The timeout bounds the connect (cto) as well as each read
+    (rto), as urllib's did: apprise's own connect timeout is 4 s. Any query on
+    the URL is dropped."""
     parsed = urllib.parse.urlsplit(url)
     scheme = "apprises" if parsed.scheme == "https" else "apprise"
     prefix, _, key = parsed.path.rpartition("/notify/")
     path = f"{prefix.strip('/')}/{key}".lstrip("/")
-    return f"{scheme}://{parsed.netloc}/{path}?method=json&version=1&retry=1&wait={_APPRISE_RETRY_WAIT_SECONDS}&rto={timeout}"
+    return (
+        f"{scheme}://{parsed.netloc}/{path}?method=json&version=1"
+        f"&retry=1&wait={_APPRISE_RETRY_WAIT_SECONDS}&cto={timeout}&rto={timeout}"
+    )
 
 
 def post_to_apprise(url, title, body):

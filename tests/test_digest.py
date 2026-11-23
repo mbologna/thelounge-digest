@@ -286,22 +286,25 @@ class TestChunkBody(unittest.TestCase):
 
 
 class _StubApprise:
-    """A local Apprise API stand-in answering every POST with one status; records the requests."""
+    """A local Apprise API stand-in answering every POST with one status (after
+    `delay` seconds); records the requests."""
 
-    def __init__(self, status):
+    def __init__(self, status, delay=0.0):
         calls = self.calls = []
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_POST(self):
                 length = int(self.headers.get("content-length", 0))
                 calls.append((self.path, self.headers.get("content-type"), json.loads(self.rfile.read(length))))
+                threading.Event().wait(delay)  # `time` here is datetime.time
                 self.send_response(status)
                 self.end_headers()
 
             def log_message(self, *args):
                 pass
 
-        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.url = f"http://127.0.0.1:{self.server.server_port}/notify/digest-key"
 
@@ -318,8 +321,8 @@ class TestPostToApprise(unittest.TestCase):
         patch.start()
         self.addCleanup(patch.stop)
 
-    def stub(self, status):
-        server = _StubApprise(status)
+    def stub(self, status, delay=0.0):
+        server = _StubApprise(status, delay)
         self.addCleanup(server.close)
         return server
 
@@ -360,18 +363,24 @@ class TestPostToApprise(unittest.TestCase):
     def test_no_url_returns_false(self):
         self.assertFalse(digest.post_to_apprise("", "t", "b"))
 
+    def test_a_reply_slower_than_the_timeout_is_not_delivered(self):
+        real = digest.apprise_api_url
+        slow = self.stub(200, delay=1.0)
+        with mock.patch.object(digest, "apprise_api_url", lambda url: real(url, timeout=0.2)):
+            self.assertFalse(digest.post_to_apprise(slow.url, "t", "b"))
+
 
 class TestAppriseApiUrl(unittest.TestCase):
     def test_http_endpoint(self):
         self.assertEqual(
             digest.apprise_api_url("http://apprise-hotel.tail.ts.net:8000/notify/thelounge", timeout=90),
-            "apprise://apprise-hotel.tail.ts.net:8000/thelounge?method=json&version=1&retry=1&wait=1&rto=90",
+            "apprise://apprise-hotel.tail.ts.net:8000/thelounge?method=json&version=1&retry=1&wait=1&cto=90&rto=90",
         )
 
     def test_https_and_a_path_prefix(self):
         self.assertEqual(
             digest.apprise_api_url("https://example.org/apprise/notify/k?preview=no", timeout=5),
-            "apprises://example.org/apprise/k?method=json&version=1&retry=1&wait=1&rto=5",
+            "apprises://example.org/apprise/k?method=json&version=1&retry=1&wait=1&cto=5&rto=5",
         )
 
 

@@ -148,6 +148,14 @@ The project skeleton comes from
 [python-app-template](https://github.com/mbologna/python-app-template)
 through [Copier](https://copier.readthedocs.io/) (`.copier-answers.yml`).
 
+## Why not an existing tool
+
+- The Lounge keeps channel logs, but has no scheduled digest or export of
+  them.
+- No The Lounge plugin on [npm](https://www.npmjs.com/) adds one.
+
+Checked 2026-11-23.
+
 ## Versioning
 
 Releases follow SemVer: [auto-release](https://github.com/mbologna/auto-release)

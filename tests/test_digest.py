@@ -1,7 +1,9 @@
 """Tests for thelounge_digest.digest — run with: uv run pytest"""
 
+import html.parser
 import http.server
 import importlib
+import io
 import json
 import os
 import sqlite3
@@ -258,31 +260,78 @@ class TestBuildNickColors(unittest.TestCase):
             importlib.reload(digest)
 
 
-class TestChunkBody(unittest.TestCase):
-    def test_short_body_is_single_chunk(self):
-        body = "hello\nworld"
-        self.assertEqual(digest.chunk_body(body, max_len=100), [body])
+class TestChunkSections(unittest.TestCase):
+    def _channel(self, name, n, width=60):
+        lines = [f"<b>📢 Net/{name}</b> · <i>{n} messages · 10:00–11:00</i>", ""]
+        for i in range(n):
+            lines += [f"🔴 <b>nick{i}</b> · <code>10:00</code>", "y" * width, ""]
+        return "\n".join(lines).rstrip()
 
-    def test_long_body_splits_on_newline(self):
-        line = "x" * 100
-        body = "\n".join([line] * 10)  # 1009 chars
-        chunks = digest.chunk_body(body, max_len=300)
+    def test_short_digest_is_one_chunk_with_blank_lines_between_sections(self):
+        self.assertEqual(digest.chunk_sections(["summary", "<b>A</b>\nline"]), ["summary\n\n<b>A</b>\nline"])
+
+    def test_long_plain_section_splits_on_newline(self):
+        body = "\n".join(["x" * 100] * 10)  # 1009 chars
+        chunks = digest.chunk_sections([body], max_len=300)
         self.assertGreater(len(chunks), 1)
-        # Every chunk must be within the limit.
         for chunk in chunks:
             self.assertLessEqual(len(chunk), 300)
-        # Reassembled body must equal original.
         self.assertEqual("\n".join(chunks), body)
 
     def test_single_long_line_stays_together(self):
         line = "x" * 5000
-        chunks = digest.chunk_body(line, max_len=4000)
-        # Can't split a line with no newlines — kept as one oversized chunk.
-        self.assertEqual(chunks, [line])
+        self.assertEqual(digest.chunk_sections([line], max_len=4000), [line])
 
     def test_exact_limit_is_single_chunk(self):
-        body = "a" * 4000
-        self.assertEqual(len(digest.chunk_body(body, max_len=4000)), 1)
+        self.assertEqual(len(digest.chunk_sections(["a" * 4000], max_len=4000)), 1)
+
+    def test_split_channel_repeats_its_title_as_continued(self):
+        chunks = digest.chunk_sections([self._channel("#one", 30)], max_len=800)
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(chunks[0].startswith("<b>📢 Net/#one</b> · <i>30 messages"))
+        for chunk in chunks[1:]:
+            self.assertTrue(chunk.startswith("<b>📢 Net/#one</b> · <i>continued</i>\n\n🔴"), chunk[:80])
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk), 800)
+            self.assertNotIn("\n\n\n", chunk)
+            parser = _TagBalance()
+            parser.feed(chunk)
+            self.assertEqual(parser.stack, [])
+
+    def test_a_title_never_ends_a_chunk_alone(self):
+        first = "z" * 700
+        chunks = digest.chunk_sections([first, self._channel("#two", 3)], max_len=760)
+        self.assertEqual(chunks[0], first)
+        self.assertTrue(chunks[1].startswith("<b>📢 Net/#two</b> · <i>3 messages"))
+        self.assertNotIn("continued", chunks[1])
+
+    def test_a_group_is_never_split_from_its_nick(self):
+        chunks = digest.chunk_sections([self._channel("#one", 30)], max_len=800)
+        for chunk in chunks:
+            body = chunk.split("\n")[2:]
+            self.assertTrue(body[0].startswith("🔴 <b>nick"), body[0])
+
+    def test_an_oversized_block_splits_between_lines_with_continued(self):
+        section = "<b>🔗 Trending links</b>\n" + "\n".join(f"• https://example.com/{i:03d}" for i in range(60))
+        chunks = digest.chunk_sections([section], max_len=600)
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks[1:]:
+            self.assertTrue(chunk.startswith("<b>🔗 Trending links</b> · <i>continued</i>\n•"), chunk[:60])
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk), 600)
+
+    def test_no_chunk_is_only_a_continued_title(self):
+        section = "<b>🔗 Trending links</b>\n" + "• short\n" + "• " + "x" * 900
+        chunks = digest.chunk_sections([section], max_len=500)
+        self.assertEqual(len(chunks), 2)
+        self.assertTrue(chunks[1].startswith("<b>🔗 Trending links</b> · <i>continued</i>\n• xxx"))
+
+    def test_every_line_is_kept(self):
+        sections = [self._channel("#one", 20), self._channel("#two", 20)]
+        chunks = digest.chunk_sections(sections, max_len=700)
+        kept = [line for c in chunks for line in c.split("\n") if "continued" not in line and line]
+        expected = [line for sec in sections for line in sec.split("\n") if line]
+        self.assertEqual(kept, expected)
 
 
 class _StubApprise:
@@ -470,10 +519,19 @@ class TestFormatChannelSection(unittest.TestCase):
         self.assertIn("📌", out)
         self.assertIn("new topic", out)
 
-    def test_kick_shows_boot_emoji(self):
-        out = self._render([self._msg(type_="kick", text="baduser")])
-        self.assertIn("👢", out)
-        self.assertIn("baduser", out)
+    def test_kick_names_the_kicked_nick_and_the_reason(self):
+        msg = self._msg(type_="kick", text="spamming")
+        msg["kicked"] = "baduser"
+        out = self._render([msg])
+        self.assertIn("👢 <b>alice</b> kicked <b>baduser</b>", out)
+        self.assertIn("<i>spamming</i>", out)
+
+    def test_kick_without_reason_has_no_reason_line(self):
+        msg = self._msg(type_="kick", text="")
+        msg["kicked"] = "baduser"
+        out = self._render([msg])
+        self.assertIn("kicked <b>baduser</b>", out)
+        self.assertTrue(out.endswith("</code>"), out)
 
     def test_self_message_has_arrow(self):
         out = self._render([self._msg(self_=True)])
@@ -533,7 +591,26 @@ class TestFormatChannelSection(unittest.TestCase):
             importlib.reload(digest)
 
 
+class _TagBalance(html.parser.HTMLParser):
+    """Fails on a closing tag that doesn't match the open one; leaves the
+    unclosed tags in .stack."""
+
+    def __init__(self):
+        super().__init__()
+        self.stack = []
+
+    def handle_starttag(self, tag, attrs):
+        self.stack.append(tag)
+
+    def handle_endtag(self, tag):
+        assert self.stack and self.stack.pop() == tag, f"unbalanced </{tag}>"
+
+
 class TestFormatTrendingSection(unittest.TestCase):
+    def test_href_is_escaped(self):
+        out = digest.format_trending_section({'https://x.com/?a=1&b="2"': {"Net/#a", "Net/#b"}})
+        self.assertIn('href="https://x.com/?a=1&amp;b=&quot;2&quot;"', out)
+
     def test_single_url_rendered_as_link(self):
         out = digest.format_trending_section({"https://example.com": {"Net/#a", "Net/#b"}})
         self.assertIn('<a href="https://example.com">https://example.com</a>', out)
@@ -545,7 +622,20 @@ class TestFormatTrendingSection(unittest.TestCase):
         a_pos, z_pos = out.index("#a"), out.index("#z")
         self.assertLess(a_pos, z_pos)
 
-    def test_urls_are_sorted(self):
+    def test_shows_how_many_channels_shared_the_link(self):
+        out = digest.format_trending_section({"https://example.com": {"Net/#a", "Net/#b"}})
+        self.assertIn("· <i>2 channels: Net/#a, Net/#b</i>", out)
+
+    def test_links_shared_in_more_channels_come_first(self):
+        out = digest.format_trending_section(
+            {
+                "https://a.com": {"Net/#a", "Net/#b"},
+                "https://z.com": {"Net/#a", "Net/#b", "Net/#c"},
+            }
+        )
+        self.assertLess(out.index("z.com"), out.index("a.com"))
+
+    def test_urls_with_equal_counts_are_sorted(self):
         out = digest.format_trending_section(
             {
                 "https://z.com": {"Net/#a", "Net/#b"},
@@ -591,14 +681,31 @@ class TestHighlightKeywords(unittest.TestCase):
         result = digest.highlight_keywords("hello world", ["python"])
         self.assertEqual(result, "hello world")
 
-    def test_keyword_mid_word_is_highlighted(self):
-        result = digest.highlight_keywords("foobar", ["foo"])
-        self.assertEqual(result, "<b>foo</b>bar")
+    def test_keyword_inside_a_word_is_not_highlighted(self):
+        self.assertEqual(digest.highlight_keywords("foobar google", ["foo", "go"]), "foobar google")
 
-    def test_html_escaped_keyword_matched(self):
-        # Input text is already html-escaped; keyword contains a special char
-        result = digest.highlight_keywords("say &lt;hello&gt;", ["<hello>"])
+    def test_keyword_next_to_punctuation_is_highlighted(self):
+        result = digest.highlight_keywords("(go), go! @go", ["go"])
+        self.assertEqual(result, "(<b>go</b>), <b>go</b>! @<b>go</b>")
+
+    def test_keyword_with_special_chars_is_escaped_inside_the_bold(self):
+        result = digest.highlight_keywords("say <hello>", ["<hello>"])
         self.assertEqual(result, "say <b>&lt;hello&gt;</b>")
+
+    def test_text_is_escaped_without_keywords(self):
+        self.assertEqual(digest.highlight_keywords("a & <b>", []), "a &amp; &lt;b&gt;")
+
+    def test_keywords_never_match_inside_entities_or_tags(self):
+        # "amp"/"lt" would break &amp;/&lt; and "b" the <b> of another keyword
+        # if matching ran on the escaped text.
+        result = digest.highlight_keywords("Tom & Jerry < amp b lt", ["amp", "b", "lt", "Tom"])
+        self.assertEqual(result, "<b>Tom</b> &amp; Jerry &lt; <b>amp</b> <b>b</b> <b>lt</b>")
+        parser = _TagBalance()
+        parser.feed(result)
+        self.assertEqual(parser.stack, [])
+
+    def test_longest_keyword_wins(self):
+        self.assertEqual(digest.highlight_keywords("python3", ["python", "python3"]), "<b>python3</b>")
 
 
 class TestFindTrendingUrls(unittest.TestCase):
@@ -720,6 +827,40 @@ class TestLookbackHoursValidation(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
 
+class TestTheLoungeUser(unittest.TestCase):
+    """The paths are read at import time, so each case imports out of process."""
+
+    def _paths(self, **env):
+        clean = {k: v for k, v in os.environ.items() if not k.startswith("THELOUNGE_")}
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from thelounge_digest import digest as d; print(d.THELOUNGE_DB); print(d.THELOUNGE_USERS_JSON)",
+            ],
+            env={**clean, **env},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.splitlines()
+
+    def test_paths_derive_from_the_user(self):
+        self.assertEqual(
+            self._paths(THELOUNGE_USER="alice"),
+            ["/thelounge/logs/alice.sqlite3", "/thelounge/users/alice.json"],
+        )
+
+    def test_explicit_paths_win(self):
+        self.assertEqual(
+            self._paths(THELOUNGE_USER="alice", THELOUNGE_DB="/x.db"),
+            ["/x.db", "/thelounge/users/alice.json"],
+        )
+
+    def test_no_user_and_no_paths_leaves_them_empty(self):
+        self.assertEqual(self._paths(), ["", ""])
+
+
 class TestSnapshotDb(unittest.TestCase):
     def test_snapshot_is_independent_copy(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -790,6 +931,19 @@ class TestCursor(unittest.TestCase):
             with mock.patch.object(digest, "CURSOR_FILE", path), self.assertRaises(TypeError):
                 digest.save_cursor({"bad": object()})
             self.assertEqual(os.listdir(tmpdir), [])
+
+
+class TestFetchKick(unittest.TestCase):
+    def test_kick_keeps_the_kicked_nick_from_target(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, network TEXT, channel TEXT, time INTEGER, type TEXT, msg TEXT)"
+        )
+        msg = {"from": {"nick": "op"}, "target": {"nick": "victim", "mode": ""}, "text": "bye"}
+        conn.execute("INSERT INTO messages VALUES (1, 'u', '#c', 1, 'kick', ?)", (json.dumps(msg),))
+        (kick,) = digest.fetch_messages(conn, "#c", 0, network_uuid="u")
+        conn.close()
+        self.assertEqual((kick["nick"], kick["kicked"], kick["text"]), ("op", "victim", "bye"))
 
 
 class TestFetchMessagesChannelOnly(unittest.TestCase):
@@ -871,7 +1025,7 @@ class TestMain(unittest.TestCase):
 
     def test_large_digest_is_sent_in_numbered_chunks(self):
         with (
-            mock.patch.object(digest, "chunk_body", return_value=["a", "b"]),
+            mock.patch.object(digest, "chunk_sections", return_value=["a", "b"]),
             mock.patch.object(digest, "post_to_apprise", return_value=True) as post,
         ):
             self._run()
@@ -888,6 +1042,14 @@ class TestMain(unittest.TestCase):
         with mock.patch.object(digest, "post_to_apprise", side_effect=[True, False]):
             self._run()
         self.assertTrue(os.path.exists(self.cursor_path))
+
+    def test_keywords_match_whole_words_only(self):
+        with (
+            mock.patch.object(digest, "DIGEST_KEYWORDS", "kern"),
+            mock.patch.object(digest, "post_to_apprise", return_value=True) as post,
+        ):
+            self._run()
+        self.assertNotIn("Keyword matches", post.call_args_list[0].args[2])
 
     def test_dry_run_sends_nothing(self):
         with mock.patch.object(digest, "post_to_apprise") as post:
@@ -919,6 +1081,17 @@ class TestMain(unittest.TestCase):
         with mock.patch.object(digest, "DIGEST_CHANNELS", "bogus, ,"), self.assertRaises(SystemExit) as cm:
             self._run()
         self.assertEqual(cm.exception.code, 1)
+
+    def test_missing_user_and_paths_is_an_error(self):
+        with (
+            mock.patch.object(digest, "THELOUNGE_DB", ""),
+            mock.patch.object(digest, "THELOUNGE_USERS_JSON", ""),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as err,
+            self.assertRaises(SystemExit) as cm,
+        ):
+            self._run()
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("set THELOUNGE_USER", err.getvalue())
 
     def test_missing_apprise_url_is_an_error(self):
         with mock.patch.object(digest, "APPRISE_URL", ""), self.assertRaises(SystemExit) as cm:

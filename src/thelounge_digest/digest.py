@@ -6,11 +6,11 @@ Reads new messages from configured channels since the last cursor position,
 finds trending links (URLs seen in >=2 channels), keyword matches, and
 POSTs a formatted digest to an Apprise endpoint.
 
-TheLounge SQLite schema (logs/michele.sqlite3):
+TheLounge SQLite schema (logs/<user>.sqlite3):
   messages(id, network TEXT, channel TEXT, time INTEGER, type TEXT, msg TEXT)
   where msg is JSON: {"from": {"nick": "..."}, "text": "...", "self": bool, ...}
   network is a UUID assigned by TheLounge, not a human-readable name.
-  UUID→name mapping is loaded from THELOUNGE_USERS_JSON (users/michele.json)
+  UUID→name mapping is loaded from THELOUNGE_USERS_JSON (users/<user>.json)
   so that identically-named channels on different networks stay separate.
 """
 
@@ -35,8 +35,13 @@ DIGEST_CHANNELS = os.environ.get("DIGEST_CHANNELS", "")
 DIGEST_KEYWORDS = os.environ.get("DIGEST_KEYWORDS", "")
 DIGEST_BOTS = {n.strip() for n in os.environ.get("DIGEST_BOTS", "").split(",") if n.strip()}
 APPRISE_URL = os.environ.get("APPRISE_URL", "")
-THELOUNGE_DB = os.environ.get("THELOUNGE_DB", "/thelounge/logs/michele.sqlite3")
-THELOUNGE_USERS_JSON = os.environ.get("THELOUNGE_USERS_JSON", "/thelounge/users/michele.json")
+# The Lounge user whose files are read, from The Lounge's home mounted on
+# /thelounge; THELOUNGE_DB and THELOUNGE_USERS_JSON override either path.
+THELOUNGE_USER = os.environ.get("THELOUNGE_USER", "")
+THELOUNGE_DB = os.environ.get("THELOUNGE_DB") or (f"/thelounge/logs/{THELOUNGE_USER}.sqlite3" if THELOUNGE_USER else "")
+THELOUNGE_USERS_JSON = os.environ.get("THELOUNGE_USERS_JSON") or (
+    f"/thelounge/users/{THELOUNGE_USER}.json" if THELOUNGE_USER else ""
+)
 CURSOR_FILE = os.environ.get("CURSOR_FILE", "/data/cursor.json")
 try:
     DIGEST_LOOKBACK_HOURS = int(os.environ.get("DIGEST_LOOKBACK_HOURS", "24"))
@@ -60,7 +65,7 @@ except ValueError:
 
 def load_network_uuids():
     """
-    Read users/michele.json and return a dict mapping network name → UUID.
+    Read users/<user>.json and return a dict mapping network name → UUID.
 
     TheLounge stores messages with the UUID in the `network` column, not the
     human-readable name. We need this mapping to filter by (uuid, channel)
@@ -135,7 +140,7 @@ def fetch_messages(conn, channel, last_id, network_uuid=None, since_ms=0):
     """
     Fetch new messages for a channel since last_id.
 
-    If network_uuid is provided (looked up from users/michele.json), filters by
+    If network_uuid is provided (looked up from users/<user>.json), filters by
     both (network, channel) so that identically-named channels on different networks
     are kept separate (e.g. #linux on Libera vs #linux on OFTC).
     Falls back to channel-only filtering when the UUID is unknown.
@@ -144,6 +149,8 @@ def fetch_messages(conn, channel, last_id, network_uuid=None, since_ms=0):
     run can pull per channel (DIGEST_LOOKBACK_HOURS). Pass 0 to disable (fetch
     all since last_id).
     Returns all messages including own (self=True) — digest shows full context.
+    A kick keeps the kicked nick (msg.target, a user object) as "kicked"; its
+    text is the kick reason.
     """
     if network_uuid:
         query = (
@@ -180,6 +187,7 @@ def fetch_messages(conn, channel, last_id, network_uuid=None, since_ms=0):
                 "nick": msg_data.get("from", {}).get("nick", "?"),
                 "text": strip_irc_formatting(msg_data.get("text", "")),
                 "self": msg_data.get("self", False),
+                "kicked": (msg_data.get("target") or {}).get("nick", "?") if row[2] == "kick" else None,
             }
         )
     return result
@@ -357,12 +365,20 @@ def format_summary_line(channel_messages, trending_urls, keyword_matches):
     return summary
 
 
+def format_link(url):
+    """An <a> for url. The href is escaped too: a " or & in a URL would
+    otherwise break the attribute, and Telegram rejects the message."""
+    escaped = html_module.escape(url)
+    return f'<a href="{escaped}">{escaped}</a>'
+
+
 def format_trending_section(trending_urls):
-    """Format the "Trending links" section from {url: {channel_keys}}."""
+    """Format the "Trending links" section from {url: {channel_keys}}, the
+    links shared in the most channels first."""
     lines = ["<b>🔗 Trending links</b>"]
-    for url, chans in sorted(trending_urls.items()):
+    for url, chans in sorted(trending_urls.items(), key=lambda item: (-len(item[1]), item[0])):
         chan_names = html_module.escape(", ".join(sorted(chans)))
-        lines.append(f'• <a href="{url}">{html_module.escape(url)}</a>  <i>({chan_names})</i>')
+        lines.append(f"• {format_link(url)} · <i>{len(chans)} channels: {chan_names}</i>")
     return "\n".join(lines)
 
 
@@ -374,21 +390,43 @@ def format_keyword_matches_section(keyword_matches, keywords, nick_colors):
         target = html_module.escape(msg["target"])
         nick = html_module.escape(msg["nick"])
         avatar = nick_colors.get(msg["nick"], "⚪")
-        text = highlight_keywords(html_module.escape(msg["text"]), keywords)
+        text = highlight_keywords(msg["text"], keywords)
         lines.append(f"<code>[{target} {time_str}]</code> {avatar} <b>{nick}</b> {text}")
     return "\n".join(lines)
 
 
-def highlight_keywords(text_escaped, keywords):
-    """Bold each matched keyword (case-insensitive) within an already-HTML-escaped string."""
-    for kw in keywords:
-        text_escaped = re.sub(
-            f"({re.escape(html_module.escape(kw))})",
-            r"<b>\1</b>",
-            text_escaped,
-            flags=re.IGNORECASE,
-        )
-    return text_escaped
+# Keywords match as whole words, with the boundaries The Lounge uses for its
+# own custom highlights (compileHighlightRegex in server/client.ts): start or
+# one of these characters before, end or one of the second set after.
+_KW_BEFORE = r"(?<![^ .,+!?|/:<>(){}'\"@&~-])"
+_KW_AFTER = r"(?![^ .,+!?|/:<>(){}'\"-])"
+
+
+def keyword_pattern(keywords):
+    """One case-insensitive regex matching any keyword as a whole word (longest
+    first), or None. Only the keyword itself is captured."""
+    if not keywords:
+        return None
+    alternatives = "|".join(re.escape(kw) for kw in sorted(keywords, key=len, reverse=True))
+    return re.compile(f"{_KW_BEFORE}({alternatives}){_KW_AFTER}", re.IGNORECASE)
+
+
+def highlight_keywords(text, keywords):
+    """HTML-escape text, bolding each whole-word keyword match (case-insensitive).
+
+    Matches are found in the raw text and every piece is escaped on its own, so
+    a keyword can never match inside an entity (&amp;) or inside the <b> added
+    for another keyword: either would break the HTML and Telegram would reject
+    the whole digest.
+    """
+    pattern = keyword_pattern(keywords)
+    if pattern is None:
+        return html_module.escape(text)
+    # split() with one capture group: the odd pieces are the matches.
+    return "".join(
+        f"<b>{html_module.escape(piece)}</b>" if i % 2 else html_module.escape(piece)
+        for i, piece in enumerate(pattern.split(text))
+    )
 
 
 def _append_group_body(lines, group, italic):
@@ -436,8 +474,10 @@ def format_channel_section(network, channel, messages, nick_colors):
         elif first["type"] == "kick":
             for msg in group:
                 t = format_time(msg["time"])
-                kicked = html_module.escape(msg["text"])
+                kicked = html_module.escape(msg.get("kicked") or "?")
                 lines.append(f"👢 <b>{nick}</b> kicked <b>{kicked}</b> · <code>{t}</code>")
+                if msg["text"]:
+                    lines.append(f"<i>{html_module.escape(msg['text'])}</i>")
         elif is_bot:
             # Bot messages: monospace nick (machine identity), italic body (automated output)
             lines.append(f"🤖 <code>{nick}</code> · <code>{time_str}</code>")
@@ -460,24 +500,61 @@ def format_channel_section(network, channel, messages, nick_colors):
     return "\n".join(lines).rstrip()
 
 
-def chunk_body(body, max_len=4000):
-    """Split body into chunks of at most max_len characters, breaking on newlines."""
-    if len(body) <= max_len:
-        return [body]
-    chunks = []
-    current_lines = []
-    current_len = 0
-    for line in body.split("\n"):
-        line_len = len(line) + 1  # +1 for the joining newline
-        if current_len + line_len > max_len and current_lines:
-            chunks.append("\n".join(current_lines))
-            current_lines = [line]
-            current_len = line_len
-        else:
-            current_lines.append(line)
-            current_len += line_len
-    if current_lines:
-        chunks.append("\n".join(current_lines))
+def chunk_sections(sections, max_len=4000):
+    """Split the digest's sections into chunks of at most max_len characters,
+    with a blank line between sections.
+
+    Chunks break between blocks (the lines between blank lines: one author's
+    group in a channel section), so a group's lines stay under its nick; only
+    a block too long for a chunk of its own is split between lines. A title
+    travels with the first block under it, and a section that runs on into the
+    next chunk has its bold title repeated there, marked "continued", so every
+    chunk says which channel its lines come from. A single line longer than
+    max_len stays whole.
+    """
+    chunks, lines = [], []
+
+    def fits(more):
+        return len("\n".join(lines + more)) <= max_len
+
+    def flush():
+        while lines and not lines[-1]:
+            lines.pop()
+        chunks.append("\n".join(lines))
+        lines.clear()
+
+    for section in sections:
+        blocks = [block.split("\n") for block in section.split("\n\n")]
+        title = blocks[0][0]
+        continued = []
+        if title.startswith("<b>"):
+            continued = [f"{title[: title.index('</b>') + 4]} · <i>continued</i>"]
+        if len(blocks) > 1 and blocks[0] == [title]:
+            # A channel section: blank line after the title, which travels
+            # with the first group.
+            blocks[:2] = [[title, "", *blocks[1]]]
+            continued += [""] if continued else []
+        for i, block in enumerate(blocks):
+            sep = [""] if lines and lines[-1] else []
+            if lines and not fits(sep + block):
+                flush()
+                if i > 0:
+                    lines.extend(continued)
+                sep = [""] if lines and lines[-1] else []
+            if fits(sep + block):
+                lines.extend(sep + block)
+                continue
+            # Too long for a chunk of its own: split it between lines.
+            lines.extend(sep)
+            for j, line in enumerate(block):
+                if lines and lines != continued and not fits([line]):
+                    flush()
+                    if i > 0 or j > 0:
+                        lines.extend(continued)
+                if line or (lines and lines[-1]):
+                    lines.append(line)
+    if lines:
+        flush()
     return chunks
 
 
@@ -529,6 +606,9 @@ def main():
     # --- Parse configuration ---
     if not DIGEST_CHANNELS:
         print("Error: DIGEST_CHANNELS is not set", file=sys.stderr)
+        sys.exit(1)
+    if not THELOUNGE_DB or not THELOUNGE_USERS_JSON:
+        print("Error: set THELOUNGE_USER (or THELOUNGE_DB and THELOUNGE_USERS_JSON)", file=sys.stderr)
         sys.exit(1)
     if not APPRISE_URL and not init_mode and not dry_run:
         print("Error: APPRISE_URL is not set", file=sys.stderr)
@@ -637,14 +717,9 @@ def main():
 
         # --- Keyword matching ---
         keyword_matches = []
-        if keywords:
-            for msgs in channel_messages.values():
-                for msg in msgs:
-                    text_lower = msg["text"].lower()
-                    for kw in keywords:
-                        if kw.lower() in text_lower:
-                            keyword_matches.append(msg)
-                            break
+        pattern = keyword_pattern(keywords)
+        if pattern:
+            keyword_matches = [msg for msgs in channel_messages.values() for msg in msgs if pattern.search(msg["text"])]
 
         # --- Check if there's anything to report ---
         total_messages = sum(len(msgs) for msgs in channel_messages.values())
@@ -685,7 +760,7 @@ def main():
         # The digest, then one message per trending link, so each link is the
         # message's first and Telegram can preview it.
         digest_url = APPRISE_URL
-        body_chunks = chunk_body(body)
+        body_chunks = chunk_sections(sections)
         for i, chunk in enumerate(body_chunks):
             if i > 0:
                 time.sleep(APPRISE_POST_DELAY_SECONDS)
@@ -700,7 +775,7 @@ def main():
         for url, chans in trending_urls.items():
             time.sleep(APPRISE_POST_DELAY_SECONDS)
             chan_names = ", ".join(sorted(chans))
-            preview_body = f'<a href="{url}">{html_module.escape(url)}</a>\n<i>({html_module.escape(chan_names)})</i>'
+            preview_body = f"{format_link(url)}\n<i>({html_module.escape(chan_names)})</i>"
             preview_success = post_to_apprise(APPRISE_URL, "Trending link", preview_body)
             if not preview_success:
                 print(f"Warning: failed to deliver trending link preview for {url}", file=sys.stderr)

@@ -389,16 +389,24 @@ def format_keyword_matches_section(keyword_matches, keywords, nick_colors):
     return "\n".join(lines)
 
 
+# Keywords match as whole words, with the boundaries The Lounge uses for its
+# own custom highlights (compileHighlightRegex in server/client.ts): start or
+# one of these characters before, end or one of the second set after.
+_KW_BEFORE = r"(?<![^ .,+!?|/:<>(){}'\"@&~-])"
+_KW_AFTER = r"(?![^ .,+!?|/:<>(){}'\"-])"
+
+
 def keyword_pattern(keywords):
-    """One case-insensitive regex matching any keyword (longest first), or None."""
+    """One case-insensitive regex matching any keyword as a whole word (longest
+    first), or None. Only the keyword itself is captured."""
     if not keywords:
         return None
     alternatives = "|".join(re.escape(kw) for kw in sorted(keywords, key=len, reverse=True))
-    return re.compile(f"({alternatives})", re.IGNORECASE)
+    return re.compile(f"{_KW_BEFORE}({alternatives}){_KW_AFTER}", re.IGNORECASE)
 
 
 def highlight_keywords(text, keywords):
-    """HTML-escape text, bolding each keyword match (case-insensitive).
+    """HTML-escape text, bolding each whole-word keyword match (case-insensitive).
 
     Matches are found in the raw text and every piece is escaped on its own, so
     a keyword can never match inside an entity (&amp;) or inside the <b> added
@@ -663,14 +671,9 @@ def main():
 
         # --- Keyword matching ---
         keyword_matches = []
-        if keywords:
-            for msgs in channel_messages.values():
-                for msg in msgs:
-                    text_lower = msg["text"].lower()
-                    for kw in keywords:
-                        if kw.lower() in text_lower:
-                            keyword_matches.append(msg)
-                            break
+        pattern = keyword_pattern(keywords)
+        if pattern:
+            keyword_matches = [msg for msgs in channel_messages.values() for msg in msgs if pattern.search(msg["text"])]
 
         # --- Check if there's anything to report ---
         total_messages = sum(len(msgs) for msgs in channel_messages.values())

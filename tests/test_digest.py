@@ -620,9 +620,12 @@ class TestHighlightKeywords(unittest.TestCase):
         result = digest.highlight_keywords("hello world", ["python"])
         self.assertEqual(result, "hello world")
 
-    def test_keyword_mid_word_is_highlighted(self):
-        result = digest.highlight_keywords("foobar", ["foo"])
-        self.assertEqual(result, "<b>foo</b>bar")
+    def test_keyword_inside_a_word_is_not_highlighted(self):
+        self.assertEqual(digest.highlight_keywords("foobar google", ["foo", "go"]), "foobar google")
+
+    def test_keyword_next_to_punctuation_is_highlighted(self):
+        result = digest.highlight_keywords("(go), go! @go", ["go"])
+        self.assertEqual(result, "(<b>go</b>), <b>go</b>! @<b>go</b>")
 
     def test_keyword_with_special_chars_is_escaped_inside_the_bold(self):
         result = digest.highlight_keywords("say <hello>", ["<hello>"])
@@ -944,6 +947,14 @@ class TestMain(unittest.TestCase):
         with mock.patch.object(digest, "post_to_apprise", side_effect=[True, False]):
             self._run()
         self.assertTrue(os.path.exists(self.cursor_path))
+
+    def test_keywords_match_whole_words_only(self):
+        with (
+            mock.patch.object(digest, "DIGEST_KEYWORDS", "kern"),
+            mock.patch.object(digest, "post_to_apprise", return_value=True) as post,
+        ):
+            self._run()
+        self.assertNotIn("Keyword matches", post.call_args_list[0].args[2])
 
     def test_dry_run_sends_nothing(self):
         with mock.patch.object(digest, "post_to_apprise") as post:

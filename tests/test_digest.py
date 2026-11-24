@@ -260,31 +260,78 @@ class TestBuildNickColors(unittest.TestCase):
             importlib.reload(digest)
 
 
-class TestChunkBody(unittest.TestCase):
-    def test_short_body_is_single_chunk(self):
-        body = "hello\nworld"
-        self.assertEqual(digest.chunk_body(body, max_len=100), [body])
+class TestChunkSections(unittest.TestCase):
+    def _channel(self, name, n, width=60):
+        lines = [f"<b>📢 Net/{name}</b> · <i>{n} messages · 10:00–11:00</i>", ""]
+        for i in range(n):
+            lines += [f"🔴 <b>nick{i}</b> · <code>10:00</code>", "y" * width, ""]
+        return "\n".join(lines).rstrip()
 
-    def test_long_body_splits_on_newline(self):
-        line = "x" * 100
-        body = "\n".join([line] * 10)  # 1009 chars
-        chunks = digest.chunk_body(body, max_len=300)
+    def test_short_digest_is_one_chunk_with_blank_lines_between_sections(self):
+        self.assertEqual(digest.chunk_sections(["summary", "<b>A</b>\nline"]), ["summary\n\n<b>A</b>\nline"])
+
+    def test_long_plain_section_splits_on_newline(self):
+        body = "\n".join(["x" * 100] * 10)  # 1009 chars
+        chunks = digest.chunk_sections([body], max_len=300)
         self.assertGreater(len(chunks), 1)
-        # Every chunk must be within the limit.
         for chunk in chunks:
             self.assertLessEqual(len(chunk), 300)
-        # Reassembled body must equal original.
         self.assertEqual("\n".join(chunks), body)
 
     def test_single_long_line_stays_together(self):
         line = "x" * 5000
-        chunks = digest.chunk_body(line, max_len=4000)
-        # Can't split a line with no newlines — kept as one oversized chunk.
-        self.assertEqual(chunks, [line])
+        self.assertEqual(digest.chunk_sections([line], max_len=4000), [line])
 
     def test_exact_limit_is_single_chunk(self):
-        body = "a" * 4000
-        self.assertEqual(len(digest.chunk_body(body, max_len=4000)), 1)
+        self.assertEqual(len(digest.chunk_sections(["a" * 4000], max_len=4000)), 1)
+
+    def test_split_channel_repeats_its_title_as_continued(self):
+        chunks = digest.chunk_sections([self._channel("#one", 30)], max_len=800)
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(chunks[0].startswith("<b>📢 Net/#one</b> · <i>30 messages"))
+        for chunk in chunks[1:]:
+            self.assertTrue(chunk.startswith("<b>📢 Net/#one</b> · <i>continued</i>\n\n🔴"), chunk[:80])
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk), 800)
+            self.assertNotIn("\n\n\n", chunk)
+            parser = _TagBalance()
+            parser.feed(chunk)
+            self.assertEqual(parser.stack, [])
+
+    def test_a_title_never_ends_a_chunk_alone(self):
+        first = "z" * 700
+        chunks = digest.chunk_sections([first, self._channel("#two", 3)], max_len=760)
+        self.assertEqual(chunks[0], first)
+        self.assertTrue(chunks[1].startswith("<b>📢 Net/#two</b> · <i>3 messages"))
+        self.assertNotIn("continued", chunks[1])
+
+    def test_a_group_is_never_split_from_its_nick(self):
+        chunks = digest.chunk_sections([self._channel("#one", 30)], max_len=800)
+        for chunk in chunks:
+            body = chunk.split("\n")[2:]
+            self.assertTrue(body[0].startswith("🔴 <b>nick"), body[0])
+
+    def test_an_oversized_block_splits_between_lines_with_continued(self):
+        section = "<b>🔗 Trending links</b>\n" + "\n".join(f"• https://example.com/{i:03d}" for i in range(60))
+        chunks = digest.chunk_sections([section], max_len=600)
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks[1:]:
+            self.assertTrue(chunk.startswith("<b>🔗 Trending links</b> · <i>continued</i>\n•"), chunk[:60])
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk), 600)
+
+    def test_no_chunk_is_only_a_continued_title(self):
+        section = "<b>🔗 Trending links</b>\n" + "• short\n" + "• " + "x" * 900
+        chunks = digest.chunk_sections([section], max_len=500)
+        self.assertEqual(len(chunks), 2)
+        self.assertTrue(chunks[1].startswith("<b>🔗 Trending links</b> · <i>continued</i>\n• xxx"))
+
+    def test_every_line_is_kept(self):
+        sections = [self._channel("#one", 20), self._channel("#two", 20)]
+        chunks = digest.chunk_sections(sections, max_len=700)
+        kept = [line for c in chunks for line in c.split("\n") if "continued" not in line and line]
+        expected = [line for sec in sections for line in sec.split("\n") if line]
+        self.assertEqual(kept, expected)
 
 
 class _StubApprise:
@@ -965,7 +1012,7 @@ class TestMain(unittest.TestCase):
 
     def test_large_digest_is_sent_in_numbered_chunks(self):
         with (
-            mock.patch.object(digest, "chunk_body", return_value=["a", "b"]),
+            mock.patch.object(digest, "chunk_sections", return_value=["a", "b"]),
             mock.patch.object(digest, "post_to_apprise", return_value=True) as post,
         ):
             self._run()

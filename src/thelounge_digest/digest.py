@@ -499,24 +499,61 @@ def format_channel_section(network, channel, messages, nick_colors):
     return "\n".join(lines).rstrip()
 
 
-def chunk_body(body, max_len=4000):
-    """Split body into chunks of at most max_len characters, breaking on newlines."""
-    if len(body) <= max_len:
-        return [body]
-    chunks = []
-    current_lines = []
-    current_len = 0
-    for line in body.split("\n"):
-        line_len = len(line) + 1  # +1 for the joining newline
-        if current_len + line_len > max_len and current_lines:
-            chunks.append("\n".join(current_lines))
-            current_lines = [line]
-            current_len = line_len
-        else:
-            current_lines.append(line)
-            current_len += line_len
-    if current_lines:
-        chunks.append("\n".join(current_lines))
+def chunk_sections(sections, max_len=4000):
+    """Split the digest's sections into chunks of at most max_len characters,
+    with a blank line between sections.
+
+    Chunks break between blocks (the lines between blank lines: one author's
+    group in a channel section), so a group's lines stay under its nick; only
+    a block too long for a chunk of its own is split between lines. A title
+    travels with the first block under it, and a section that runs on into the
+    next chunk has its bold title repeated there, marked "continued", so every
+    chunk says which channel its lines come from. A single line longer than
+    max_len stays whole.
+    """
+    chunks, lines = [], []
+
+    def fits(more):
+        return len("\n".join(lines + more)) <= max_len
+
+    def flush():
+        while lines and not lines[-1]:
+            lines.pop()
+        chunks.append("\n".join(lines))
+        lines.clear()
+
+    for section in sections:
+        blocks = [block.split("\n") for block in section.split("\n\n")]
+        title = blocks[0][0]
+        continued = []
+        if title.startswith("<b>"):
+            continued = [f"{title[: title.index('</b>') + 4]} · <i>continued</i>"]
+        if len(blocks) > 1 and blocks[0] == [title]:
+            # A channel section: blank line after the title, which travels
+            # with the first group.
+            blocks[:2] = [[title, "", *blocks[1]]]
+            continued += [""] if continued else []
+        for i, block in enumerate(blocks):
+            sep = [""] if lines and lines[-1] else []
+            if lines and not fits(sep + block):
+                flush()
+                if i > 0:
+                    lines.extend(continued)
+                sep = [""] if lines and lines[-1] else []
+            if fits(sep + block):
+                lines.extend(sep + block)
+                continue
+            # Too long for a chunk of its own: split it between lines.
+            lines.extend(sep)
+            for j, line in enumerate(block):
+                if lines and lines != continued and not fits([line]):
+                    flush()
+                    if i > 0 or j > 0:
+                        lines.extend(continued)
+                if line or (lines and lines[-1]):
+                    lines.append(line)
+    if lines:
+        flush()
     return chunks
 
 
@@ -722,7 +759,7 @@ def main():
         # The digest, then one message per trending link, so each link is the
         # message's first and Telegram can preview it.
         digest_url = APPRISE_URL
-        body_chunks = chunk_body(body)
+        body_chunks = chunk_sections(sections)
         for i, chunk in enumerate(body_chunks):
             if i > 0:
                 time.sleep(APPRISE_POST_DELAY_SECONDS)

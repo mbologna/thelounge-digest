@@ -6,11 +6,11 @@ Reads new messages from configured channels since the last cursor position,
 finds trending links (URLs seen in >=2 channels), keyword matches, and
 POSTs a formatted digest to an Apprise endpoint.
 
-TheLounge SQLite schema (logs/michele.sqlite3):
+TheLounge SQLite schema (logs/<user>.sqlite3):
   messages(id, network TEXT, channel TEXT, time INTEGER, type TEXT, msg TEXT)
   where msg is JSON: {"from": {"nick": "..."}, "text": "...", "self": bool, ...}
   network is a UUID assigned by TheLounge, not a human-readable name.
-  UUID→name mapping is loaded from THELOUNGE_USERS_JSON (users/michele.json)
+  UUID→name mapping is loaded from THELOUNGE_USERS_JSON (users/<user>.json)
   so that identically-named channels on different networks stay separate.
 """
 
@@ -35,8 +35,13 @@ DIGEST_CHANNELS = os.environ.get("DIGEST_CHANNELS", "")
 DIGEST_KEYWORDS = os.environ.get("DIGEST_KEYWORDS", "")
 DIGEST_BOTS = {n.strip() for n in os.environ.get("DIGEST_BOTS", "").split(",") if n.strip()}
 APPRISE_URL = os.environ.get("APPRISE_URL", "")
-THELOUNGE_DB = os.environ.get("THELOUNGE_DB", "/thelounge/logs/michele.sqlite3")
-THELOUNGE_USERS_JSON = os.environ.get("THELOUNGE_USERS_JSON", "/thelounge/users/michele.json")
+# The Lounge user whose files are read, from The Lounge's home mounted on
+# /thelounge; THELOUNGE_DB and THELOUNGE_USERS_JSON override either path.
+THELOUNGE_USER = os.environ.get("THELOUNGE_USER", "")
+THELOUNGE_DB = os.environ.get("THELOUNGE_DB") or (f"/thelounge/logs/{THELOUNGE_USER}.sqlite3" if THELOUNGE_USER else "")
+THELOUNGE_USERS_JSON = os.environ.get("THELOUNGE_USERS_JSON") or (
+    f"/thelounge/users/{THELOUNGE_USER}.json" if THELOUNGE_USER else ""
+)
 CURSOR_FILE = os.environ.get("CURSOR_FILE", "/data/cursor.json")
 try:
     DIGEST_LOOKBACK_HOURS = int(os.environ.get("DIGEST_LOOKBACK_HOURS", "24"))
@@ -60,7 +65,7 @@ except ValueError:
 
 def load_network_uuids():
     """
-    Read users/michele.json and return a dict mapping network name → UUID.
+    Read users/<user>.json and return a dict mapping network name → UUID.
 
     TheLounge stores messages with the UUID in the `network` column, not the
     human-readable name. We need this mapping to filter by (uuid, channel)
@@ -135,7 +140,7 @@ def fetch_messages(conn, channel, last_id, network_uuid=None, since_ms=0):
     """
     Fetch new messages for a channel since last_id.
 
-    If network_uuid is provided (looked up from users/michele.json), filters by
+    If network_uuid is provided (looked up from users/<user>.json), filters by
     both (network, channel) so that identically-named channels on different networks
     are kept separate (e.g. #linux on Libera vs #linux on OFTC).
     Falls back to channel-only filtering when the UUID is unknown.
@@ -563,6 +568,9 @@ def main():
     # --- Parse configuration ---
     if not DIGEST_CHANNELS:
         print("Error: DIGEST_CHANNELS is not set", file=sys.stderr)
+        sys.exit(1)
+    if not THELOUNGE_DB or not THELOUNGE_USERS_JSON:
+        print("Error: set THELOUNGE_USER (or THELOUNGE_DB and THELOUNGE_USERS_JSON)", file=sys.stderr)
         sys.exit(1)
     if not APPRISE_URL and not init_mode and not dry_run:
         print("Error: APPRISE_URL is not set", file=sys.stderr)

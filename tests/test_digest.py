@@ -3,6 +3,7 @@
 import html.parser
 import http.server
 import importlib
+import io
 import json
 import os
 import sqlite3
@@ -766,6 +767,40 @@ class TestLookbackHoursValidation(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
 
+class TestTheLoungeUser(unittest.TestCase):
+    """The paths are read at import time, so each case imports out of process."""
+
+    def _paths(self, **env):
+        clean = {k: v for k, v in os.environ.items() if not k.startswith("THELOUNGE_")}
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from thelounge_digest import digest as d; print(d.THELOUNGE_DB); print(d.THELOUNGE_USERS_JSON)",
+            ],
+            env={**clean, **env},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.splitlines()
+
+    def test_paths_derive_from_the_user(self):
+        self.assertEqual(
+            self._paths(THELOUNGE_USER="alice"),
+            ["/thelounge/logs/alice.sqlite3", "/thelounge/users/alice.json"],
+        )
+
+    def test_explicit_paths_win(self):
+        self.assertEqual(
+            self._paths(THELOUNGE_USER="alice", THELOUNGE_DB="/x.db"),
+            ["/x.db", "/thelounge/users/alice.json"],
+        )
+
+    def test_no_user_and_no_paths_leaves_them_empty(self):
+        self.assertEqual(self._paths(), ["", ""])
+
+
 class TestSnapshotDb(unittest.TestCase):
     def test_snapshot_is_independent_copy(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -986,6 +1021,17 @@ class TestMain(unittest.TestCase):
         with mock.patch.object(digest, "DIGEST_CHANNELS", "bogus, ,"), self.assertRaises(SystemExit) as cm:
             self._run()
         self.assertEqual(cm.exception.code, 1)
+
+    def test_missing_user_and_paths_is_an_error(self):
+        with (
+            mock.patch.object(digest, "THELOUNGE_DB", ""),
+            mock.patch.object(digest, "THELOUNGE_USERS_JSON", ""),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as err,
+            self.assertRaises(SystemExit) as cm,
+        ):
+            self._run()
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("set THELOUNGE_USER", err.getvalue())
 
     def test_missing_apprise_url_is_an_error(self):
         with mock.patch.object(digest, "APPRISE_URL", ""), self.assertRaises(SystemExit) as cm:

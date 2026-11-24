@@ -360,12 +360,19 @@ def format_summary_line(channel_messages, trending_urls, keyword_matches):
     return summary
 
 
+def format_link(url):
+    """An <a> for url. The href is escaped too: a " or & in a URL would
+    otherwise break the attribute, and Telegram rejects the message."""
+    escaped = html_module.escape(url)
+    return f'<a href="{escaped}">{escaped}</a>'
+
+
 def format_trending_section(trending_urls):
     """Format the "Trending links" section from {url: {channel_keys}}."""
     lines = ["<b>🔗 Trending links</b>"]
     for url, chans in sorted(trending_urls.items()):
         chan_names = html_module.escape(", ".join(sorted(chans)))
-        lines.append(f'• <a href="{url}">{html_module.escape(url)}</a>  <i>({chan_names})</i>')
+        lines.append(f"• {format_link(url)}  <i>({chan_names})</i>")
     return "\n".join(lines)
 
 
@@ -377,21 +384,35 @@ def format_keyword_matches_section(keyword_matches, keywords, nick_colors):
         target = html_module.escape(msg["target"])
         nick = html_module.escape(msg["nick"])
         avatar = nick_colors.get(msg["nick"], "⚪")
-        text = highlight_keywords(html_module.escape(msg["text"]), keywords)
+        text = highlight_keywords(msg["text"], keywords)
         lines.append(f"<code>[{target} {time_str}]</code> {avatar} <b>{nick}</b> {text}")
     return "\n".join(lines)
 
 
-def highlight_keywords(text_escaped, keywords):
-    """Bold each matched keyword (case-insensitive) within an already-HTML-escaped string."""
-    for kw in keywords:
-        text_escaped = re.sub(
-            f"({re.escape(html_module.escape(kw))})",
-            r"<b>\1</b>",
-            text_escaped,
-            flags=re.IGNORECASE,
-        )
-    return text_escaped
+def keyword_pattern(keywords):
+    """One case-insensitive regex matching any keyword (longest first), or None."""
+    if not keywords:
+        return None
+    alternatives = "|".join(re.escape(kw) for kw in sorted(keywords, key=len, reverse=True))
+    return re.compile(f"({alternatives})", re.IGNORECASE)
+
+
+def highlight_keywords(text, keywords):
+    """HTML-escape text, bolding each keyword match (case-insensitive).
+
+    Matches are found in the raw text and every piece is escaped on its own, so
+    a keyword can never match inside an entity (&amp;) or inside the <b> added
+    for another keyword: either would break the HTML and Telegram would reject
+    the whole digest.
+    """
+    pattern = keyword_pattern(keywords)
+    if pattern is None:
+        return html_module.escape(text)
+    # split() with one capture group: the odd pieces are the matches.
+    return "".join(
+        f"<b>{html_module.escape(piece)}</b>" if i % 2 else html_module.escape(piece)
+        for i, piece in enumerate(pattern.split(text))
+    )
 
 
 def _append_group_body(lines, group, italic):
@@ -705,7 +726,7 @@ def main():
         for url, chans in trending_urls.items():
             time.sleep(APPRISE_POST_DELAY_SECONDS)
             chan_names = ", ".join(sorted(chans))
-            preview_body = f'<a href="{url}">{html_module.escape(url)}</a>\n<i>({html_module.escape(chan_names)})</i>'
+            preview_body = f"{format_link(url)}\n<i>({html_module.escape(chan_names)})</i>"
             preview_success = post_to_apprise(APPRISE_URL, "Trending link", preview_body)
             if not preview_success:
                 print(f"Warning: failed to deliver trending link preview for {url}", file=sys.stderr)

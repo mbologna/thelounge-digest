@@ -1,5 +1,6 @@
 """Tests for thelounge_digest.digest — run with: uv run pytest"""
 
+import html.parser
 import http.server
 import importlib
 import json
@@ -542,7 +543,26 @@ class TestFormatChannelSection(unittest.TestCase):
             importlib.reload(digest)
 
 
+class _TagBalance(html.parser.HTMLParser):
+    """Fails on a closing tag that doesn't match the open one; leaves the
+    unclosed tags in .stack."""
+
+    def __init__(self):
+        super().__init__()
+        self.stack = []
+
+    def handle_starttag(self, tag, attrs):
+        self.stack.append(tag)
+
+    def handle_endtag(self, tag):
+        assert self.stack and self.stack.pop() == tag, f"unbalanced </{tag}>"
+
+
 class TestFormatTrendingSection(unittest.TestCase):
+    def test_href_is_escaped(self):
+        out = digest.format_trending_section({'https://x.com/?a=1&b="2"': {"Net/#a", "Net/#b"}})
+        self.assertIn('href="https://x.com/?a=1&amp;b=&quot;2&quot;"', out)
+
     def test_single_url_rendered_as_link(self):
         out = digest.format_trending_section({"https://example.com": {"Net/#a", "Net/#b"}})
         self.assertIn('<a href="https://example.com">https://example.com</a>', out)
@@ -604,10 +624,24 @@ class TestHighlightKeywords(unittest.TestCase):
         result = digest.highlight_keywords("foobar", ["foo"])
         self.assertEqual(result, "<b>foo</b>bar")
 
-    def test_html_escaped_keyword_matched(self):
-        # Input text is already html-escaped; keyword contains a special char
-        result = digest.highlight_keywords("say &lt;hello&gt;", ["<hello>"])
+    def test_keyword_with_special_chars_is_escaped_inside_the_bold(self):
+        result = digest.highlight_keywords("say <hello>", ["<hello>"])
         self.assertEqual(result, "say <b>&lt;hello&gt;</b>")
+
+    def test_text_is_escaped_without_keywords(self):
+        self.assertEqual(digest.highlight_keywords("a & <b>", []), "a &amp; &lt;b&gt;")
+
+    def test_keywords_never_match_inside_entities_or_tags(self):
+        # "amp"/"lt" would break &amp;/&lt; and "b" the <b> of another keyword
+        # if matching ran on the escaped text.
+        result = digest.highlight_keywords("Tom & Jerry < amp b lt", ["amp", "b", "lt", "Tom"])
+        self.assertEqual(result, "<b>Tom</b> &amp; Jerry &lt; <b>amp</b> <b>b</b> <b>lt</b>")
+        parser = _TagBalance()
+        parser.feed(result)
+        self.assertEqual(parser.stack, [])
+
+    def test_longest_keyword_wins(self):
+        self.assertEqual(digest.highlight_keywords("python3", ["python", "python3"]), "<b>python3</b>")
 
 
 class TestFindTrendingUrls(unittest.TestCase):

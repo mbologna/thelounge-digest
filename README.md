@@ -15,9 +15,12 @@ a schedule.
 ## What a run does
 
 1. Copies the live database to a snapshot in `/tmp` with SQLite's backup
-   API and queries the snapshot. The Lounge keeps its database in
-   rollback-journal mode, so a long read on the live file would block its
-   writes for the whole run; the copy holds the lock for seconds.
+   API and queries the snapshot. The official The Lounge image keeps its
+   database in rollback-journal mode, where a long read on the live file
+   would block its writes for the whole run; the copy holds the lock for
+   seconds. [thelounge-patched](https://github.com/mbologna/thelounge-patched)
+   switches the database to WAL mode, where readers don't block the writer,
+   and the run takes the snapshot all the same.
 2. For each `Network/#channel` in `DIGEST_CHANNELS`, reads the messages,
    notices, actions, topic changes and kicks newer than that channel's saved
    cursor and no older than `DIGEST_LOOKBACK_HOURS`. The window stops a new
@@ -25,18 +28,23 @@ a schedule.
    one digest; older messages are skipped and the cursor moves past them.
 3. Collects trending links: URLs posted in at least two channels, ignoring
    your own messages and those of the nicks in `DIGEST_BOTS`.
-4. Collects messages containing any of `DIGEST_KEYWORDS` (case-insensitive)
-   and highlights the keyword in bold.
+4. Collects messages containing any of `DIGEST_KEYWORDS` as a whole word
+   (case-insensitive, with the word boundaries of The Lounge's own custom
+   highlights, so `go` matches "go!" but not "google") and highlights the
+   keyword in bold.
 5. Builds the digest: a one-line count of messages, channels, trending links
    and keyword matches when more than one channel has news, then one section
-   per channel, then the trending links and keyword matches. Nick colours
+   per channel, then the trending links (those shared in the most channels
+   first) and keyword matches. Nick colours
    follow The Lounge's own colour assignment; bots, your own messages,
    actions and notices are set apart. If nothing is new, the run sends
    nothing and exits 0.
 6. Posts the digest, titled `The Lounge Digest`, split into chunks of at
    most 4,000 characters (under [Telegram](https://telegram.org/)'s message
    limit) with `APPRISE_POST_DELAY_SECONDS` between posts to avoid flood
-   control. Each trending link follows as its own `Trending link` message,
+   control. Chunks break between one author's groups of lines, and a
+   channel that runs on into the next chunk starts it again with its name
+   marked "continued". Each trending link follows as its own `Trending link` message,
    so it is the message's first link and Telegram can preview it. Posting
    goes through the [apprise](https://github.com/caronc/apprise) library:
    each URL in `APPRISE_URL` is its own priority group, so they are tried in
@@ -59,15 +67,14 @@ All settings are environment variables.
 | `DIGEST_CHANNELS` | yes | | Comma-separated `Network/#channel` pairs, with the network names The Lounge shows, such as `Libera/#chan,Libera/##other` |
 | `APPRISE_URL` | yes, except with `--init` or `--dry-run` | | Apprise API notify URL, such as `http://apprise:8000/notify/<key>`. Several whitespace-separated URLs for the same key are tried in order until one delivers, so a second Apprise server can be the fallback |
 | `DIGEST_BOTS` | no | empty | Comma-separated bot nicks: shown as bots, given no nick colour and ignored for trending links |
-| `DIGEST_KEYWORDS` | no | empty | Comma-separated keywords to highlight and list in their own section |
-| `THELOUNGE_DB` | no | `/thelounge/logs/michele.sqlite3` | The Lounge's SQLite log for your user, `logs/<user>.sqlite3` in its home |
-| `THELOUNGE_USERS_JSON` | no | `/thelounge/users/michele.json` | The Lounge's configuration for your user, `users/<user>.json`, read for the network UUIDs |
+| `DIGEST_KEYWORDS` | no | empty | Comma-separated keywords, matched as whole words, to highlight and list in their own section |
+| `THELOUNGE_USER` | yes, unless both paths below are set | | Your user name in The Lounge, which names its files in its home (mounted on `/thelounge`) |
+| `THELOUNGE_DB` | no | `/thelounge/logs/<user>.sqlite3` | The Lounge's SQLite log for your user |
+| `THELOUNGE_USERS_JSON` | no | `/thelounge/users/<user>.json` | The Lounge's configuration for your user, read for the network UUIDs |
 | `CURSOR_FILE` | no | `/data/cursor.json` | Last message ID seen per channel, kept between runs |
 | `DIGEST_LOOKBACK_HOURS` | no | `24` | Oldest message a digest may include, in hours (a positive integer) |
 | `APPRISE_POST_DELAY_SECONDS` | no | `1.5` | Pause between consecutive Apprise posts |
 | `TZ` | no | `UTC` | Time zone of the timestamps in the digest |
-
-The two path defaults name the author's user; set them to your own.
 
 ## Command-line flags
 
@@ -87,8 +94,7 @@ flags go after the image name:
 ```sh
 docker run --rm \
   -e DIGEST_CHANNELS="Libera/#chan" \
-  -e THELOUNGE_DB=/thelounge/logs/alice.sqlite3 \
-  -e THELOUNGE_USERS_JSON=/thelounge/users/alice.json \
+  -e THELOUNGE_USER=alice \
   -e APPRISE_URL="http://apprise:8000/notify/irc" \
   -e TZ=Europe/London \
   -v /path/to/thelounge:/thelounge:ro \
@@ -123,7 +129,7 @@ uv run pytest --cov
 uv run ruff check . && uv run ruff format --check .
 uv run pre-commit install        # once
 uv run pre-commit run --all-files
-uv run thelounge-digest --dry-run   # needs DIGEST_CHANNELS and THELOUNGE_*
+uv run thelounge-digest --dry-run   # needs DIGEST_CHANNELS and THELOUNGE_DB/THELOUNGE_USERS_JSON
 ```
 
 `pytest --cov` fails below the coverage floor, `fail_under` in
@@ -155,6 +161,17 @@ through [Copier](https://copier.readthedocs.io/) (`.copier-answers.yml`).
 - No The Lounge plugin on [npm](https://www.npmjs.com/) adds one.
 
 Checked 2026-11-23.
+
+## Related projects
+
+- [thelounge-patched](https://github.com/mbologna/thelounge-patched): the
+  official The Lounge image with fixes waiting to land upstream, among them
+  the WAL mode that lets this digest read the database without blocking it.
+- [thelounge-plugin-apprise-push](https://github.com/mbologna/thelounge-plugin-apprise-push):
+  push notifications for highlights and private messages, through the same
+  Apprise API.
+- [thelounge-theme-chat](https://github.com/mbologna/thelounge-theme-chat):
+  a light and dark theme for The Lounge.
 
 ## Versioning
 

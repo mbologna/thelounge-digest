@@ -470,10 +470,19 @@ class TestFormatChannelSection(unittest.TestCase):
         self.assertIn("📌", out)
         self.assertIn("new topic", out)
 
-    def test_kick_shows_boot_emoji(self):
-        out = self._render([self._msg(type_="kick", text="baduser")])
-        self.assertIn("👢", out)
-        self.assertIn("baduser", out)
+    def test_kick_names_the_kicked_nick_and_the_reason(self):
+        msg = self._msg(type_="kick", text="spamming")
+        msg["kicked"] = "baduser"
+        out = self._render([msg])
+        self.assertIn("👢 <b>alice</b> kicked <b>baduser</b>", out)
+        self.assertIn("<i>spamming</i>", out)
+
+    def test_kick_without_reason_has_no_reason_line(self):
+        msg = self._msg(type_="kick", text="")
+        msg["kicked"] = "baduser"
+        out = self._render([msg])
+        self.assertIn("kicked <b>baduser</b>", out)
+        self.assertTrue(out.endswith("</code>"), out)
 
     def test_self_message_has_arrow(self):
         out = self._render([self._msg(self_=True)])
@@ -790,6 +799,19 @@ class TestCursor(unittest.TestCase):
             with mock.patch.object(digest, "CURSOR_FILE", path), self.assertRaises(TypeError):
                 digest.save_cursor({"bad": object()})
             self.assertEqual(os.listdir(tmpdir), [])
+
+
+class TestFetchKick(unittest.TestCase):
+    def test_kick_keeps_the_kicked_nick_from_target(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, network TEXT, channel TEXT, time INTEGER, type TEXT, msg TEXT)"
+        )
+        msg = {"from": {"nick": "op"}, "target": {"nick": "victim", "mode": ""}, "text": "bye"}
+        conn.execute("INSERT INTO messages VALUES (1, 'u', '#c', 1, 'kick', ?)", (json.dumps(msg),))
+        (kick,) = digest.fetch_messages(conn, "#c", 0, network_uuid="u")
+        conn.close()
+        self.assertEqual((kick["nick"], kick["kicked"], kick["text"]), ("op", "victim", "bye"))
 
 
 class TestFetchMessagesChannelOnly(unittest.TestCase):

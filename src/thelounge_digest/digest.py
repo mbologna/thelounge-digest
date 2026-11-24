@@ -144,6 +144,8 @@ def fetch_messages(conn, channel, last_id, network_uuid=None, since_ms=0):
     run can pull per channel (DIGEST_LOOKBACK_HOURS). Pass 0 to disable (fetch
     all since last_id).
     Returns all messages including own (self=True) — digest shows full context.
+    A kick keeps the kicked nick (msg.target, a user object) as "kicked"; its
+    text is the kick reason.
     """
     if network_uuid:
         query = (
@@ -180,6 +182,7 @@ def fetch_messages(conn, channel, last_id, network_uuid=None, since_ms=0):
                 "nick": msg_data.get("from", {}).get("nick", "?"),
                 "text": strip_irc_formatting(msg_data.get("text", "")),
                 "self": msg_data.get("self", False),
+                "kicked": (msg_data.get("target") or {}).get("nick", "?") if row[2] == "kick" else None,
             }
         )
     return result
@@ -436,8 +439,10 @@ def format_channel_section(network, channel, messages, nick_colors):
         elif first["type"] == "kick":
             for msg in group:
                 t = format_time(msg["time"])
-                kicked = html_module.escape(msg["text"])
+                kicked = html_module.escape(msg.get("kicked") or "?")
                 lines.append(f"👢 <b>{nick}</b> kicked <b>{kicked}</b> · <code>{t}</code>")
+                if msg["text"]:
+                    lines.append(f"<i>{html_module.escape(msg['text'])}</i>")
         elif is_bot:
             # Bot messages: monospace nick (machine identity), italic body (automated output)
             lines.append(f"🤖 <code>{nick}</code> · <code>{time_str}</code>")

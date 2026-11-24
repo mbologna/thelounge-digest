@@ -373,11 +373,12 @@ def format_link(url):
 
 
 def format_trending_section(trending_urls):
-    """Format the "Trending links" section from {url: {channel_keys}}."""
+    """Format the "Trending links" section from {url: {channel_keys}}, the
+    links shared in the most channels first."""
     lines = ["<b>🔗 Trending links</b>"]
-    for url, chans in sorted(trending_urls.items()):
+    for url, chans in sorted(trending_urls.items(), key=lambda item: (-len(item[1]), item[0])):
         chan_names = html_module.escape(", ".join(sorted(chans)))
-        lines.append(f"• {format_link(url)}  <i>({chan_names})</i>")
+        lines.append(f"• {format_link(url)} · <i>{len(chans)} channels: {chan_names}</i>")
     return "\n".join(lines)
 
 

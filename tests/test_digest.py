@@ -622,7 +622,20 @@ class TestFormatTrendingSection(unittest.TestCase):
         a_pos, z_pos = out.index("#a"), out.index("#z")
         self.assertLess(a_pos, z_pos)
 
-    def test_urls_are_sorted(self):
+    def test_shows_how_many_channels_shared_the_link(self):
+        out = digest.format_trending_section({"https://example.com": {"Net/#a", "Net/#b"}})
+        self.assertIn("· <i>2 channels: Net/#a, Net/#b</i>", out)
+
+    def test_links_shared_in_more_channels_come_first(self):
+        out = digest.format_trending_section(
+            {
+                "https://a.com": {"Net/#a", "Net/#b"},
+                "https://z.com": {"Net/#a", "Net/#b", "Net/#c"},
+            }
+        )
+        self.assertLess(out.index("z.com"), out.index("a.com"))
+
+    def test_urls_with_equal_counts_are_sorted(self):
         out = digest.format_trending_section(
             {
                 "https://z.com": {"Net/#a", "Net/#b"},
